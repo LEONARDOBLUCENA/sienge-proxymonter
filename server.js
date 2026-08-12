@@ -304,6 +304,226 @@ app.get('/api/sienge/contas-receber-completo', async (req, res) => {
   }
 });
 
+// ---------- Sync completo: devolve linhas prontas no formato DATA.csv do BI ----------
+// Junta Contas a Pagar e Contas a Receber, já mapeados para {data, complemento, valor, cc, conta, tipo, mes, ano}.
+// Isso é o que o botão "Sync Sienge" do BI vai chamar.
+//
+// Uso: /api/sienge/sync-completo?startDate=2026-01-01&endDate=2026-01-31
+//
+// Mapeamento de Contas a Receber (não tem plano financeiro, só um código de documento):
+//   CT  -> 10101 - Receita de Incorporação de Imóveis (venda de imóvel)
+//   EMP -> 10501 - Empréstimos
+//   REC, FAT, outros -> 10201 - Receita de Prestação de Serviço
+const MAPA_CONTA_RECEBER = {
+  CT: '10101 - Receita de Incorporação de Imóveis',
+  EMP: '10501 - Empréstimos',
+};
+const CONTA_RECEBER_PADRAO = '10201 - Receita de Prestação de Serviço';
+
+function contaDeRecebivel(documentId) {
+  return MAPA_CONTA_RECEBER[documentId] || CONTA_RECEBER_PADRAO;
+}
+
+// Caches simples em memória (duram enquanto o servidor está no ar) — evitam repetir
+// chamadas ao Sienge para o mesmo fornecedor/conta/obra dentro da mesma sincronização.
+const cacheCredores = new Map();
+const cacheCategorias = new Map();
+const cacheEmpreendimentos = new Map();
+
+async function nomeCredor(creditorId) {
+  if (!creditorId) return 'Fornecedor não identificado';
+  if (cacheCredores.has(creditorId)) return cacheCredores.get(creditorId);
+  try {
+    const r = await fetch(`${SIENGE_BASE_URL}/creditors/${creditorId}`, { headers: { Authorization: authHeader() } });
+    if (!r.ok) { cacheCredores.set(creditorId, `Credor ${creditorId}`); return cacheCredores.get(creditorId); }
+    const d = await r.json();
+    const nome = d.name || d.tradeName || `Credor ${creditorId}`;
+    cacheCredores.set(creditorId, nome);
+    return nome;
+  } catch {
+    return `Credor ${creditorId}`;
+  }
+}
+
+async function nomeCategoria(categoriaId) {
+  if (!categoriaId) return null;
+  if (cacheCategorias.has(categoriaId)) return cacheCategorias.get(categoriaId);
+  try {
+    const r = await fetch(`${SIENGE_BASE_URL}/payment-categories/${categoriaId}`, { headers: { Authorization: authHeader() } });
+    if (!r.ok) { cacheCategorias.set(categoriaId, `${categoriaId} - Categoria`); return cacheCategorias.get(categoriaId); }
+    const d = await r.json();
+    const texto = `${categoriaId} - ${d.name || 'Categoria'}`;
+    cacheCategorias.set(categoriaId, texto);
+    return texto;
+  } catch {
+    return `${categoriaId} - Categoria`;
+  }
+}
+
+async function obraDoTitulo(billId) {
+  const chave = `bill-${billId}`;
+  if (cacheEmpreendimentos.has(chave)) return cacheEmpreendimentos.get(chave);
+  try {
+    const r = await fetch(`${SIENGE_BASE_URL}/bills/${billId}/buildings-cost`, { headers: { Authorization: authHeader() } });
+    if (!r.ok) { cacheEmpreendimentos.set(chave, 'ADMINISTRATIVO'); return 'ADMINISTRATIVO'; }
+    const d = await r.json();
+    const nome = (d.results && d.results[0] && d.results[0].buildingName) || 'ADMINISTRATIVO';
+    cacheEmpreendimentos.set(chave, nome);
+    return nome;
+  } catch {
+    return 'ADMINISTRATIVO';
+  }
+}
+
+async function obraDoRecebivel(billReceivableId) {
+  const chave = `recebivel-${billReceivableId}`;
+  if (cacheEmpreendimentos.has(chave)) return cacheEmpreendimentos.get(chave);
+  try {
+    const r = await fetch(`${SIENGE_BASE_URL}/accounts-receivable/receivable-bills/${billReceivableId}`, { headers: { Authorization: authHeader() } });
+    if (!r.ok) { cacheEmpreendimentos.set(chave, 'ADMINISTRATIVO'); return 'ADMINISTRATIVO'; }
+    const d = await r.json();
+    const nome = d.enterpriseName || 'ADMINISTRATIVO';
+    cacheEmpreendimentos.set(chave, nome);
+    return nome;
+  } catch {
+    return 'ADMINISTRATIVO';
+  }
+}
+
+function linhaCsv(dataISO, complemento, valor, cc, conta, tipo) {
+  const d = new Date(dataISO + 'T00:00:00');
+  return {
+    data: dataISO,
+    complemento,
+    valor: Number(valor) || 0,
+    cc,
+    conta,
+    tipo,
+    mes: d.getMonth(), // 0-indexado, igual ao resto do BI
+    ano: d.getFullYear(),
+  };
+}
+
+app.get('/api/sienge/sync-completo', async (req, res) => {
+  if (!credenciaisOk()) {
+    return res.status(500).json({ erro: 'Variáveis de ambiente do Sienge não configuradas no Railway.' });
+  }
+  const { startDate, endDate } = req.query;
+  if (!startDate || !endDate) {
+    return res.status(400).json({ erro: 'Informe startDate e endDate na URL, formato AAAA-MM-DD.' });
+  }
+
+  const linhas = [];
+  const avisos = [];
+
+  try {
+    // ===== CONTAS A PAGAR =====
+    const limitePorPagina = 100;
+    let offset = 0;
+    let bills = [];
+    while (true) {
+      const url = `${SIENGE_BASE_URL}/bills?startDate=${startDate}&endDate=${endDate}&selectionType=D&limit=${limitePorPagina}&offset=${offset}`;
+      const r = await fetch(url, { headers: { Authorization: authHeader() } });
+      if (!r.ok) { avisos.push(`Falha ao buscar bills: status ${r.status}`); break; }
+      const dados = await r.json();
+      const pagina = dados.results || [];
+      bills = bills.concat(pagina);
+      const total = (dados.resultSetMetadata && dados.resultSetMetadata.count) || 0;
+      offset += limitePorPagina;
+      if (pagina.length === 0 || offset >= total) break;
+    }
+
+    const TAMANHO_LOTE = 5;
+    for (let i = 0; i < bills.length; i += TAMANHO_LOTE) {
+      const lote = bills.slice(i, i + TAMANHO_LOTE);
+      await Promise.all(lote.map(async (bill) => {
+        try {
+          const [rInst, rCat, credorNome, obraNome] = await Promise.all([
+            fetch(`${SIENGE_BASE_URL}/bills/${bill.id}/installments`, { headers: { Authorization: authHeader() } }),
+            fetch(`${SIENGE_BASE_URL}/bills/${bill.id}/budget-categories`, { headers: { Authorization: authHeader() } }),
+            nomeCredor(bill.creditorId),
+            obraDoTitulo(bill.id),
+          ]);
+          const instData = rInst.ok ? await rInst.json() : { results: [] };
+          const installments = instData.results || [];
+          const catData = rCat.ok ? await rCat.json() : { results: [] };
+          const categoriaId = (catData.results && catData.results[0] && catData.results[0].paymentCategoriesId) || null;
+          const contaTexto = categoriaId ? await nomeCategoria(categoriaId) : `${bill.documentIdentificationId || 'SEM CATEGORIA'}`;
+
+          installments.forEach((inst) => {
+            const pago = inst.situation === 'Totalmente paga';
+            const prefixo = pago ? 'Pagamento' : 'A pagar';
+            const dataRef = inst.dueDate || bill.issueDate;
+            linhas.push(linhaCsv(dataRef, `${prefixo} - ${credorNome}`, inst.amount, obraNome, contaTexto, 'PAGAMENTO'));
+          });
+        } catch (e) {
+          avisos.push(`Erro no título ${bill.id}: ${String(e)}`);
+        }
+      }));
+    }
+
+    // ===== CONTAS A RECEBER =====
+    let clientes = [];
+    offset = 0;
+    while (true) {
+      const url = `${SIENGE_BASE_URL}/customers?limit=${limitePorPagina}&offset=${offset}`;
+      const r = await fetch(url, { headers: { Authorization: authHeader() } });
+      if (!r.ok) { avisos.push(`Falha ao buscar customers: status ${r.status}`); break; }
+      const dados = await r.json();
+      const pagina = dados.results || [];
+      clientes = clientes.concat(pagina);
+      const total = (dados.resultSetMetadata && dados.resultSetMetadata.count) || 0;
+      offset += limitePorPagina;
+      if (pagina.length === 0 || offset >= total) break;
+    }
+    const clientesComDocumento = clientes.filter(c => c.cpf || c.cnpj);
+
+    for (let i = 0; i < clientesComDocumento.length; i += TAMANHO_LOTE) {
+      const lote = clientesComDocumento.slice(i, i + TAMANHO_LOTE);
+      await Promise.all(lote.map(async (cliente) => {
+        const paramDoc = cliente.cnpj ? `cnpj=${cliente.cnpj}` : `cpf=${cliente.cpf}`;
+        try {
+          const rSaldo = await fetch(`${SIENGE_BASE_URL}/current-debit-balance?${paramDoc}`, { headers: { Authorization: authHeader() } });
+          if (!rSaldo.ok) { avisos.push(`Erro no cliente ${cliente.name}: status ${rSaldo.status}`); return; }
+          const dadosSaldo = await rSaldo.json();
+          const contasRecebiveis = dadosSaldo.results || [];
+
+          for (const conta of contasRecebiveis) {
+            const contaTexto = contaDeRecebivel(conta.documentId);
+            const obraNome = await obraDoRecebivel(conta.billReceivableId);
+
+            (conta.paidInstallments || []).forEach((inst) => {
+              (inst.receipts || []).forEach((rec) => {
+                if (!rec.receiptDate) return;
+                if (rec.receiptDate < startDate || rec.receiptDate > endDate) return; // filtra pelo período pedido
+                linhas.push(linhaCsv(rec.receiptDate, `Recebimento - ${cliente.name}`, rec.receiptValue, obraNome, contaTexto, 'FATURAMENTO'));
+              });
+            });
+            (conta.payableInstallments || []).forEach((inst) => {
+              if (!inst.dueDate) return;
+              if (inst.dueDate < startDate || inst.dueDate > endDate) return;
+              linhas.push(linhaCsv(inst.dueDate, `A receber - ${cliente.name}`, inst.currentBalance, obraNome, contaTexto, 'FATURAMENTO'));
+            });
+          }
+        } catch (e) {
+          avisos.push(`Erro no cliente ${cliente.name}: ${String(e)}`);
+        }
+      }));
+    }
+
+    res.json({
+      status: 200,
+      ok: true,
+      periodo: { startDate, endDate },
+      totalLinhas: linhas.length,
+      avisos,
+      csv: linhas,
+    });
+  } catch (err) {
+    res.status(502).json({ erro: 'Falha ao montar sincronização completa', detalhe: String(err), avisos });
+  }
+});
+
 // ---------- Proxy genérico ----------
 // Encaminha qualquer caminho para a API do Sienge, adicionando a autenticação no servidor.
 // Exemplo de uso no front-end:
