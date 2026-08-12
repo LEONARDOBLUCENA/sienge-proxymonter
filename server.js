@@ -365,13 +365,14 @@ async function nomeCategoria(categoriaId) {
   if (cacheCategorias.has(categoriaId)) return cacheCategorias.get(categoriaId);
   try {
     const r = await fetchSienge(`${SIENGE_BASE_URL}/payment-categories/${categoriaId}`);
-    if (!r.ok) { cacheCategorias.set(categoriaId, `${categoriaId} - Categoria`); return cacheCategorias.get(categoriaId); }
+    if (r.status === 404) { const t=`${categoriaId} - Categoria não encontrada`; cacheCategorias.set(categoriaId, t); return t; }
+    if (!r.ok) return null; // falha real (ex: 429 persistente) — não assume, não cacheia
     const d = await r.json();
     const texto = `${categoriaId} - ${d.name || 'Categoria'}`;
     cacheCategorias.set(categoriaId, texto);
     return texto;
   } catch {
-    return `${categoriaId} - Categoria`;
+    return null;
   }
 }
 
@@ -380,13 +381,14 @@ async function obraDoTitulo(billId) {
   if (cacheEmpreendimentos.has(chave)) return cacheEmpreendimentos.get(chave);
   try {
     const r = await fetchSienge(`${SIENGE_BASE_URL}/bills/${billId}/buildings-cost`);
-    if (!r.ok) { cacheEmpreendimentos.set(chave, 'ADMINISTRATIVO'); return 'ADMINISTRATIVO'; }
+    if (r.status === 404) { cacheEmpreendimentos.set(chave, 'ADMINISTRATIVO'); return 'ADMINISTRATIVO'; } // confirmado: sem obra vinculada
+    if (!r.ok) return null; // falha real na consulta — não assume ADMINISTRATIVO
     const d = await r.json();
     const nome = (d.results && d.results[0] && d.results[0].buildingName) || 'ADMINISTRATIVO';
     cacheEmpreendimentos.set(chave, nome);
     return nome;
   } catch {
-    return 'ADMINISTRATIVO';
+    return null;
   }
 }
 
@@ -395,13 +397,14 @@ async function obraDoRecebivel(billReceivableId) {
   if (cacheEmpreendimentos.has(chave)) return cacheEmpreendimentos.get(chave);
   try {
     const r = await fetchSienge(`${SIENGE_BASE_URL}/accounts-receivable/receivable-bills/${billReceivableId}`);
-    if (!r.ok) { cacheEmpreendimentos.set(chave, 'ADMINISTRATIVO'); return 'ADMINISTRATIVO'; }
+    if (r.status === 404) { cacheEmpreendimentos.set(chave, 'ADMINISTRATIVO'); return 'ADMINISTRATIVO'; }
+    if (!r.ok) return null;
     const d = await r.json();
     const nome = d.enterpriseName || 'ADMINISTRATIVO';
     cacheEmpreendimentos.set(chave, nome);
     return nome;
   } catch {
-    return 'ADMINISTRATIVO';
+    return null;
   }
 }
 
@@ -463,13 +466,16 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
           const installments = instData.results || [];
           const catData = rCat.ok ? await rCat.json() : { results: [] };
           const categoriaId = (catData.results && catData.results[0] && catData.results[0].paymentCategoriesId) || null;
-          const contaTexto = categoriaId ? await nomeCategoria(categoriaId) : `${bill.documentIdentificationId || 'SEM CATEGORIA'}`;
+          let contaTexto = categoriaId ? await nomeCategoria(categoriaId) : `${bill.documentIdentificationId || 'SEM CATEGORIA'}`;
+          if (contaTexto === null) { contaTexto = `${categoriaId} - FALHA NA CONSULTA (sincronize de novo)`; avisos.push(`Falha ao buscar categoria do título ${bill.id} — linha marcada, sincronize de novo`); }
+          let obraFinal = obraNome;
+          if (obraFinal === null) { obraFinal = 'FALHA NA CONSULTA (sincronize de novo)'; avisos.push(`Falha ao buscar obra do título ${bill.id} — linha marcada, sincronize de novo`); }
 
           installments.forEach((inst) => {
             const pago = inst.situation === 'Totalmente paga';
             const prefixo = pago ? 'Pagamento' : 'A pagar';
             const dataRef = inst.dueDate || bill.issueDate;
-            linhas.push(linhaCsv(dataRef, `${prefixo} - ${credorNome}`, inst.amount, obraNome, contaTexto, 'PAGAMENTO'));
+            linhas.push(linhaCsv(dataRef, `${prefixo} - ${credorNome}`, inst.amount, obraFinal, contaTexto, 'PAGAMENTO'));
           });
         } catch (e) {
           avisos.push(`Erro no título ${bill.id}: ${String(e)}`);
@@ -507,7 +513,8 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
 
           for (const conta of contasRecebiveis) {
             const contaTexto = contaDeRecebivel(conta.documentId);
-            const obraNome = await obraDoRecebivel(conta.billReceivableId);
+            let obraNome = await obraDoRecebivel(conta.billReceivableId);
+            if (obraNome === null) { obraNome = 'FALHA NA CONSULTA (sincronize de novo)'; avisos.push(`Falha ao buscar obra do recebível ${conta.billReceivableId} (cliente ${cliente.name}) — linha marcada, sincronize de novo`); }
 
             (conta.paidInstallments || []).forEach((inst) => {
               (inst.receipts || []).forEach((rec) => {
