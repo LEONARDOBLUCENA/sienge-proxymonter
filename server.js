@@ -462,6 +462,9 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
       if (pagina.length === 0 || offset >= total) break;
     }
 
+    const debugAtivo = req.query.debug === '1';
+    const debugInfo = [];
+
     const TAMANHO_LOTE = 3; // devagar de propósito, o Sienge bloqueia (429) se for rápido demais
     for (let i = 0; i < bills.length; i += TAMANHO_LOTE) {
       const lote = bills.slice(i, i + TAMANHO_LOTE);
@@ -473,6 +476,15 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
             nomeCredor(bill.creditorId),
             obraDoTitulo(bill.id),
           ]);
+          if (debugAtivo && debugInfo.length < 8) {
+            try {
+              const rDebug = await fetch(`${SIENGE_BASE_URL}/bills/${bill.id}/buildings-cost`, { headers: { Authorization: authHeader() } });
+              const corpoDebug = await rDebug.text();
+              debugInfo.push({ billId: bill.id, statusBuildingsCost: rDebug.status, corpoBuildingsCost: safeJson(corpoDebug), obraResolvida: obraNome });
+            } catch (eDebug) {
+              debugInfo.push({ billId: bill.id, erroDebug: String(eDebug) });
+            }
+          }
           const instData = rInst.ok ? await rInst.json() : { results: [] };
           const installments = instData.results || [];
           const catData = rCat.ok ? await rCat.json() : { results: [] };
@@ -554,6 +566,7 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
       periodo: { startDate, endDate },
       totalLinhas: linhas.length,
       avisos,
+      debug: debugAtivo ? debugInfo : undefined,
       csv: linhas,
     });
   } catch (err) {
