@@ -502,84 +502,64 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
   const avisos = [];
 
   try {
-    // ===== CONTAS A PAGAR =====
-    // Busca títulos com uma janela de EMISSÃO bem mais larga que o período pedido — muita fatura de
-    // obra é emitida bem antes do vencimento das parcelas. O filtro fino pelo período pedido acontece
-    // depois, parcela por parcela, usando a data de vencimento de cada uma (não a emissão do título).
-    const limitePorPagina = 100;
-    let offset = 0;
-    let bills = [];
-    const dataEmissaoMinima = startDate < '2000-01-01' ? startDate : '2000-01-01'; // nunca fica mais "curto" que o período pedido pelo usuário
-    while (true) {
-      const url = `${SIENGE_BASE_URL}/bills?startDate=${dataEmissaoMinima}&endDate=${endDate}&selectionType=D&limit=${limitePorPagina}&offset=${offset}`;
-      const r = await fetchSienge(url);
-      if (!r.ok) { avisos.push(`Falha ao buscar bills: status ${r.status}`); break; }
-      const dados = await r.json();
-      const pagina = dados.results || [];
-      bills = bills.concat(pagina);
-      const total = (dados.resultSetMetadata && dados.resultSetMetadata.count) || 0;
-      offset += limitePorPagina;
-      if (pagina.length === 0 || offset >= total) break;
+    // ===== CONTAS A PAGAR (via bulk-data /outcome — já traz fornecedor, obra e categoria prontos) =====
+    const debugAtivo = req.query.debug === '1';
+
+    async function buscarOutcome(tipoSelecao) {
+      let offset = 0;
+      const limit = 200;
+      let registros = [];
+      while (true) {
+        const params = new URLSearchParams({
+          startDate, endDate, selectionType: tipoSelecao,
+          correctionIndexerId: '0',
+          correctionDate: endDate,
+          limit: String(limit),
+          offset: String(offset),
+        });
+        const r = await fetchSienge(`${SIENGE_BULK_URL}/outcome?${params.toString()}`);
+        if (!r.ok) { avisos.push(`Falha ao buscar outcome (${tipoSelecao}): status ${r.status}`); break; }
+        const dados = await r.json();
+        const pagina = dados.data || [];
+        registros = registros.concat(pagina);
+        if (pagina.length < limit) break;
+        offset += limit;
+      }
+      return registros;
     }
 
-    const debugAtivo = req.query.debug === '1';
-    const debugInfo = [];
-    const buscarDataPagamentoReal = req.query.dataPagamentoReal === '1';
+    const categoriaDoRegistro = (rec) => {
+      const cat = (rec.paymentsCategories && rec.paymentsCategories[0]) || {};
+      return cat.financialCategoryId ? `${cat.financialCategoryId} - ${cat.financialCategoryName || 'Categoria'}` : 'SEM CATEGORIA';
+    };
+    const obraDoRegistro = (rec) => {
+      const cat = (rec.paymentsCategories && rec.paymentsCategories[0]) || {};
+      return cat.costCenterName || 'ADMINISTRATIVO';
+    };
 
-    const TAMANHO_LOTE = 3; // devagar de propósito, o Sienge bloqueia (429) se for rápido demais
-    for (let i = 0; i < bills.length; i += TAMANHO_LOTE) {
-      const lote = bills.slice(i, i + TAMANHO_LOTE);
-      await Promise.all(lote.map(async (bill) => {
-        try {
-          const rInst = await fetchSienge(`${SIENGE_BASE_URL}/bills/${bill.id}/installments`);
-          const instData = rInst.ok ? await rInst.json() : { results: [] };
-          const installments = (instData.results || []).filter((inst) => {
-            const pago = inst.situation === 'Totalmente paga';
-            if (pago && buscarDataPagamentoReal) return true; // ainda não sabemos a data real de pagamento — decide depois de consultar
-            const dataRef = inst.dueDate || bill.issueDate;
-            return dataRef && dataRef >= startDate && dataRef <= endDate; // parcela em aberto: filtra já pelo vencimento
-          });
-          if (!installments.length) return; // nenhuma parcela desse título é candidata ao período — não vale a pena consultar credor/categoria/obra
+    // Vencimento (D) — só interessa quem AINDA TEM SALDO em aberto (vira "A pagar")
+    const registrosD = await buscarOutcome('D');
+    registrosD.forEach((rec) => {
+      const saldo = rec.correctedBalanceAmount ?? rec.balanceAmount ?? 0;
+      if (!saldo || saldo <= 0) return; // já foi totalmente pago — o pagamento entra pela busca de pagamento (P)
+      if (!rec.dueDate) return;
+      linhas.push(linhaCsv(rec.dueDate, `A pagar - ${rec.creditorName || 'Fornecedor não identificado'}`, saldo, obraDoRegistro(rec), categoriaDoRegistro(rec), 'PAGAMENTO'));
+    });
 
-          const [rCat, credorNome, obraNome] = await Promise.all([
-            fetchSienge(`${SIENGE_BASE_URL}/bills/${bill.id}/budget-categories`),
-            nomeCredor(bill.creditorId),
-            obraDoTitulo(bill.id),
-          ]);
-          if (debugAtivo && debugInfo.length < 8) {
-            try {
-              const rDebug = await fetch(`${SIENGE_BASE_URL}/bills/${bill.id}/buildings-cost`, { headers: { Authorization: authHeader() } });
-              const corpoDebug = await rDebug.text();
-              debugInfo.push({ billId: bill.id, statusBuildingsCost: rDebug.status, corpoBuildingsCost: safeJson(corpoDebug), obraResolvida: obraNome });
-            } catch (eDebug) {
-              debugInfo.push({ billId: bill.id, erroDebug: String(eDebug) });
-            }
-          }
-          const catData = rCat.ok ? await rCat.json() : { results: [] };
-          const categoriaId = (catData.results && catData.results[0] && catData.results[0].paymentCategoriesId) || null;
-          let contaTexto = categoriaId ? await nomeCategoria(categoriaId) : `${bill.documentIdentificationId || 'SEM CATEGORIA'}`;
-          if (contaTexto === null) { contaTexto = `${categoriaId} - FALHA NA CONSULTA (sincronize de novo)`; avisos.push(`Falha ao buscar categoria do título ${bill.id} — linha marcada, sincronize de novo`); }
-          let obraFinal = obraNome;
-          if (obraFinal === null) { obraFinal = 'FALHA NA CONSULTA (sincronize de novo)'; avisos.push(`Falha ao buscar obra do título ${bill.id} — linha marcada, sincronize de novo`); }
+    // Pagamento (P) — cada pagamento de verdade, na data real em que aconteceu
+    const registrosP = await buscarOutcome('P');
+    let totalPagamentosEncontrados = 0;
+    registrosP.forEach((rec) => {
+      (rec.payments || []).forEach((pag) => {
+        if (!pag.paymentDate) return;
+        const valor = pag.netAmount ?? pag.amount ?? 0;
+        linhas.push(linhaCsv(pag.paymentDate, `Pagamento - ${rec.creditorName || 'Fornecedor não identificado'}`, valor, obraDoRegistro(rec), categoriaDoRegistro(rec), 'PAGAMENTO'));
+        totalPagamentosEncontrados++;
+      });
+    });
 
-          for (const inst of installments) {
-            let dataRef = inst.dueDate || bill.issueDate;
-            const pago = inst.situation === 'Totalmente paga';
-            const prefixo = pago ? 'Pagamento' : 'A pagar';
-            const idParcela = inst.installmentId ?? inst.indexId ?? inst.installmentNumber;
-            if (pago && buscarDataPagamentoReal) {
-              const dataReal = idParcela != null ? await dataPagamentoReal(bill.id, idParcela) : null;
-              if (dataReal) dataRef = dataReal;
-              // só entra se a data (real, ou vencimento se não achou a real) cair mesmo no período pedido
-              if (!dataRef || dataRef < startDate || dataRef > endDate) continue;
-            }
-            linhas.push(linhaCsv(dataRef, `${prefixo} - ${credorNome}`, inst.amount, obraFinal, contaTexto, 'PAGAMENTO'));
-          }
-        } catch (e) {
-          avisos.push(`Erro no título ${bill.id}: ${String(e)}`);
-        }
-      }));
-      await esperar(250); // respiro entre lotes para não estourar o limite do Sienge
+    if (debugAtivo) {
+      avisos.push(`[debug] registros D: ${registrosD.length}, registros P: ${registrosP.length}, pagamentos individuais: ${totalPagamentosEncontrados}`);
     }
 
     // ===== CONTAS A RECEBER =====
@@ -641,7 +621,7 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
       periodo: { startDate, endDate },
       totalLinhas: linhas.length,
       avisos,
-      debug: debugAtivo ? debugInfo : undefined,
+      debug: undefined,
       csv: linhas,
     });
   } catch (err) {
