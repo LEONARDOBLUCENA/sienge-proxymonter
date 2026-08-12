@@ -52,11 +52,12 @@ function esperar(ms) {
 
 // O Sienge bloqueia (status 429) quando recebe requisições rápidas demais.
 // Essa função tenta de novo, esperando um pouco mais a cada tentativa.
-async function fetchSienge(url, tentativas = 6) {
+async function fetchSienge(url, tentativas = 8) {
   for (let i = 0; i < tentativas; i++) {
     const r = await fetch(url, { headers: { Authorization: authHeader() } });
     if (r.status !== 429) return r;
-    await esperar(1000 * (i + 1));
+    const jitter = Math.floor(Math.random() * 500);
+    await esperar(1200 * (i + 1) + jitter);
   }
   return fetch(url, { headers: { Authorization: authHeader() } });
 }
@@ -74,6 +75,16 @@ app.get('/', (req, res) => {
 
 // Healthcheck simples (Railway usa isso para saber se o deploy está saudável)
 app.get('/health', (req, res) => res.status(200).send('ok'));
+
+// Limpa o cache de fornecedores/categorias/obras guardado em memória — útil se algum
+// resultado errado tiver ficado guardado (ex: por causa de um bloqueio 429 no meio de uma sincronização)
+app.get('/api/limpar-cache', (req, res) => {
+  const antes = { credores: cacheCredores.size, categorias: cacheCategorias.size, empreendimentos: cacheEmpreendimentos.size };
+  cacheCredores.clear();
+  cacheCategorias.clear();
+  cacheEmpreendimentos.clear();
+  res.json({ ok: true, limpo: antes });
+});
 
 // Testa se as credenciais do Sienge estão funcionando de fato
 app.get('/api/test', async (req, res) => {
@@ -123,7 +134,7 @@ app.get('/api/sienge/contas-pagar-completo', async (req, res) => {
     let offset = 0;
     let bills = [];
     while (true) {
-      const url = `${SIENGE_BASE_URL}/bills?startDate=${startDate}&endDate=${endDate}&selectionType=D&limit=${limitePorPagina}&offset=${offset}`;
+      const url = `${SIENGE_BASE_URL}/bills?startDate=${startDate}&endDate=${endDate}&selectionType=P&limit=${limitePorPagina}&offset=${offset}`;
       const r = await fetch(url, { headers: { Authorization: authHeader() } });
       if (!r.ok) {
         const texto = await r.text();
@@ -440,7 +451,7 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
     let offset = 0;
     let bills = [];
     while (true) {
-      const url = `${SIENGE_BASE_URL}/bills?startDate=${startDate}&endDate=${endDate}&selectionType=D&limit=${limitePorPagina}&offset=${offset}`;
+      const url = `${SIENGE_BASE_URL}/bills?startDate=${startDate}&endDate=${endDate}&selectionType=P&limit=${limitePorPagina}&offset=${offset}`;
       const r = await fetchSienge(url);
       if (!r.ok) { avisos.push(`Falha ao buscar bills: status ${r.status}`); break; }
       const dados = await r.json();
@@ -501,8 +512,9 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
     }
     const clientesComDocumento = clientes.filter(c => c.cpf || c.cnpj);
 
-    for (let i = 0; i < clientesComDocumento.length; i += TAMANHO_LOTE) {
-      const lote = clientesComDocumento.slice(i, i + TAMANHO_LOTE);
+    const TAMANHO_LOTE_CLIENTES = 1; // sequencial de propósito — essa etapa foi a que mais travou no Sienge
+    for (let i = 0; i < clientesComDocumento.length; i += TAMANHO_LOTE_CLIENTES) {
+      const lote = clientesComDocumento.slice(i, i + TAMANHO_LOTE_CLIENTES);
       await Promise.all(lote.map(async (cliente) => {
         const paramDoc = cliente.cnpj ? `cnpj=${cliente.cnpj}` : `cpf=${cliente.cpf}`;
         try {
@@ -533,7 +545,7 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
           avisos.push(`Erro no cliente ${cliente.name}: ${String(e)}`);
         }
       }));
-      await esperar(250);
+      await esperar(400);
     }
 
     res.json({
