@@ -564,8 +564,9 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
 
     // ===== CONTAS A RECEBER =====
     await esperar(2000); // pausa maior entre as duas fases, para o limite do Sienge "resetar"
+    const limitePorPagina = 100;
+    let offset = 0;
     let clientes = [];
-    offset = 0;
     while (true) {
       const url = `${SIENGE_BASE_URL}/customers?limit=${limitePorPagina}&offset=${offset}`;
       const r = await fetchSienge(url);
