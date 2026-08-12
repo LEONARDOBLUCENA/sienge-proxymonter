@@ -88,6 +88,222 @@ app.get('/api/test', async (req, res) => {
   }
 });
 
+// ---------- Contas a Pagar completo (títulos + parcelas, pago x a pagar) ----------
+// Isso resolve o trabalho manual de abrir /bills e depois cada /bills/{id}/installments
+// um por um. Aqui o servidor já faz tudo isso e devolve pronto, uma linha por parcela.
+//
+// Uso: /api/sienge/contas-pagar-completo?startDate=2026-01-01&endDate=2026-01-31
+app.get('/api/sienge/contas-pagar-completo', async (req, res) => {
+  if (!credenciaisOk()) {
+    return res.status(500).json({ erro: 'Variáveis de ambiente do Sienge não configuradas no Railway.' });
+  }
+  const { startDate, endDate } = req.query;
+  if (!startDate || !endDate) {
+    return res.status(400).json({ erro: 'Informe startDate e endDate na URL, formato AAAA-MM-DD. Ex: ?startDate=2026-01-01&endDate=2026-01-31' });
+  }
+
+  try {
+    // 1) Busca todos os títulos (bills) do período, paginando (a API devolve no máximo 100/200 por vez)
+    const limitePorPagina = 100;
+    let offset = 0;
+    let bills = [];
+    while (true) {
+      const url = `${SIENGE_BASE_URL}/bills?startDate=${startDate}&endDate=${endDate}&selectionType=D&limit=${limitePorPagina}&offset=${offset}`;
+      const r = await fetch(url, { headers: { Authorization: authHeader() } });
+      if (!r.ok) {
+        const texto = await r.text();
+        return res.status(r.status).json({ erro: 'Falha ao buscar títulos (bills)', resposta: safeJson(texto) });
+      }
+      const dados = await r.json();
+      const pagina = dados.results || [];
+      bills = bills.concat(pagina);
+      const total = (dados.resultSetMetadata && dados.resultSetMetadata.count) || 0;
+      offset += limitePorPagina;
+      if (pagina.length === 0 || offset >= total) break;
+    }
+
+    // 2) Para cada título, busca as parcelas (installments) — em lotes, para não sobrecarregar a API do Sienge
+    const TAMANHO_LOTE = 5;
+    const comInstallments = [];
+    for (let i = 0; i < bills.length; i += TAMANHO_LOTE) {
+      const lote = bills.slice(i, i + TAMANHO_LOTE);
+      const respostasLote = await Promise.all(lote.map(async (bill) => {
+        try {
+          const rInst = await fetch(`${SIENGE_BASE_URL}/bills/${bill.id}/installments`, {
+            headers: { Authorization: authHeader() },
+          });
+          if (!rInst.ok) return { bill, installments: [], erroParcelas: `status ${rInst.status}` };
+          const dadosInst = await rInst.json();
+          const installments = Array.isArray(dadosInst) ? dadosInst : (dadosInst.results || []);
+          return { bill, installments };
+        } catch (e) {
+          return { bill, installments: [], erroParcelas: String(e) };
+        }
+      }));
+      comInstallments.push(...respostasLote);
+    }
+
+    // 3) Achata tudo em uma lista simples: uma linha por parcela, já classificada
+    const parcelas = [];
+    comInstallments.forEach(({ bill, installments, erroParcelas }) => {
+      if (!installments.length) {
+        parcelas.push({
+          billId: bill.id,
+          documentNumber: bill.documentNumber,
+          documentIdentificationId: bill.documentIdentificationId,
+          creditorId: bill.creditorId,
+          debtorId: bill.debtorId,
+          issueDate: bill.issueDate,
+          totalInvoiceAmount: bill.totalInvoiceAmount,
+          erroParcelas: erroParcelas || 'Sem parcelas retornadas',
+        });
+        return;
+      }
+      installments.forEach((inst) => {
+        // Campos de saldo/valor variam um pouco conforme a API do Sienge — mantemos o "raw"
+        // para você conferir os nomes exatos e eu ajustar aqui se precisar.
+        const saldo = inst.balanceAmount ?? inst.currentBalance ?? null;
+        const pago = saldo !== null ? saldo <= 0 : (inst.status === 'paid' || inst.status === 2 || inst.status === 3);
+        parcelas.push({
+          billId: bill.id,
+          documentNumber: bill.documentNumber,
+          documentIdentificationId: bill.documentIdentificationId,
+          creditorId: bill.creditorId,
+          debtorId: bill.debtorId,
+          issueDate: bill.issueDate,
+          installmentId: inst.id ?? inst.installmentId,
+          dueDate: inst.dueDate,
+          amount: inst.amount ?? inst.originalValue ?? null,
+          balance: saldo,
+          pago,
+          raw: inst,
+        });
+      });
+    });
+
+    res.json({
+      status: 200,
+      ok: true,
+      periodo: { startDate, endDate },
+      totalTitulos: bills.length,
+      totalParcelas: parcelas.length,
+      resultados: parcelas,
+    });
+  } catch (err) {
+    res.status(502).json({ erro: 'Falha ao montar contas a pagar completo', detalhe: String(err) });
+  }
+});
+
+// ---------- Contas a Receber completo (clientes + parcelas, recebido x a receber) ----------
+// Busca todos os clientes e, para cada um, consulta o saldo devedor (que já traz as
+// parcelas pagas e as parcelas em aberto). Devolve tudo achatado, uma linha por parcela.
+//
+// Uso: /api/sienge/contas-receber-completo
+app.get('/api/sienge/contas-receber-completo', async (req, res) => {
+  if (!credenciaisOk()) {
+    return res.status(500).json({ erro: 'Variáveis de ambiente do Sienge não configuradas no Railway.' });
+  }
+
+  try {
+    // 1) Busca todos os clientes, paginando
+    const limitePorPagina = 100;
+    let offset = 0;
+    let clientes = [];
+    while (true) {
+      const url = `${SIENGE_BASE_URL}/customers?limit=${limitePorPagina}&offset=${offset}`;
+      const r = await fetch(url, { headers: { Authorization: authHeader() } });
+      if (!r.ok) {
+        const texto = await r.text();
+        return res.status(r.status).json({ erro: 'Falha ao buscar clientes (customers)', resposta: safeJson(texto) });
+      }
+      const dados = await r.json();
+      const pagina = dados.results || [];
+      clientes = clientes.concat(pagina);
+      const total = (dados.resultSetMetadata && dados.resultSetMetadata.count) || 0;
+      offset += limitePorPagina;
+      if (pagina.length === 0 || offset >= total) break;
+    }
+
+    // Só interessam os clientes que têm CPF ou CNPJ (current-debit-balance exige um dos dois)
+    const clientesComDocumento = clientes.filter(c => c.cpf || c.cnpj);
+
+    // 2) Para cada cliente, busca o saldo devedor presente (em lotes, para não sobrecarregar o Sienge)
+    const TAMANHO_LOTE = 5;
+    const comSaldo = [];
+    for (let i = 0; i < clientesComDocumento.length; i += TAMANHO_LOTE) {
+      const lote = clientesComDocumento.slice(i, i + TAMANHO_LOTE);
+      const respostasLote = await Promise.all(lote.map(async (cliente) => {
+        const paramDoc = cliente.cnpj ? `cnpj=${cliente.cnpj}` : `cpf=${cliente.cpf}`;
+        try {
+          const rSaldo = await fetch(`${SIENGE_BASE_URL}/current-debit-balance?${paramDoc}`, {
+            headers: { Authorization: authHeader() },
+          });
+          if (!rSaldo.ok) return { cliente, contas: [], erroSaldo: `status ${rSaldo.status}` };
+          const dadosSaldo = await rSaldo.json();
+          const contas = dadosSaldo.results || [];
+          return { cliente, contas };
+        } catch (e) {
+          return { cliente, contas: [], erroSaldo: String(e) };
+        }
+      }));
+      comSaldo.push(...respostasLote);
+    }
+
+    // 3) Achata tudo em uma lista simples: uma linha por parcela, já classificada
+    const parcelas = [];
+    comSaldo.forEach(({ cliente, contas, erroSaldo }) => {
+      if (erroSaldo) {
+        parcelas.push({
+          customerId: cliente.id,
+          customerName: cliente.name,
+          erroSaldo,
+        });
+        return;
+      }
+      contas.forEach((conta) => {
+        (conta.paidInstallments || []).forEach((inst) => {
+          parcelas.push({
+            customerId: cliente.id,
+            customerName: cliente.name,
+            billReceivableId: conta.billReceivableId,
+            documentId: conta.documentId,
+            installmentId: inst.installmentId,
+            dueDate: inst.dueDate,
+            originalValue: inst.originalValue,
+            adjustedValue: inst.adjustedValue,
+            recebido: true,
+            recibos: inst.receipts || [],
+          });
+        });
+        (conta.payableInstallments || []).forEach((inst) => {
+          parcelas.push({
+            customerId: cliente.id,
+            customerName: cliente.name,
+            billReceivableId: conta.billReceivableId,
+            documentId: conta.documentId,
+            installmentId: inst.installmentId,
+            dueDate: inst.dueDate,
+            originalValue: inst.originalValue,
+            adjustedValue: inst.adjustedValue,
+            currentBalance: inst.currentBalance,
+            recebido: false,
+          });
+        });
+      });
+    });
+
+    res.json({
+      status: 200,
+      ok: true,
+      totalClientes: clientesComDocumento.length,
+      totalParcelas: parcelas.length,
+      resultados: parcelas,
+    });
+  } catch (err) {
+    res.status(502).json({ erro: 'Falha ao montar contas a receber completo', detalhe: String(err) });
+  }
+});
+
 // ---------- Proxy genérico ----------
 // Encaminha qualquer caminho para a API do Sienge, adicionando a autenticação no servidor.
 // Exemplo de uso no front-end:
