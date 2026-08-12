@@ -46,6 +46,21 @@ function authHeader() {
   return `Basic ${token}`;
 }
 
+function esperar(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// O Sienge bloqueia (status 429) quando recebe requisições rápidas demais.
+// Essa função tenta de novo, esperando um pouco mais a cada tentativa.
+async function fetchSienge(url, tentativas = 4) {
+  for (let i = 0; i < tentativas; i++) {
+    const r = await fetch(url, { headers: { Authorization: authHeader() } });
+    if (r.status !== 429) return r;
+    await esperar(700 * (i + 1));
+  }
+  return fetch(url, { headers: { Authorization: authHeader() } });
+}
+
 // ---------- Rotas de diagnóstico ----------
 
 // Raiz - confirma que o serviço subiu
@@ -334,7 +349,7 @@ async function nomeCredor(creditorId) {
   if (!creditorId) return 'Fornecedor não identificado';
   if (cacheCredores.has(creditorId)) return cacheCredores.get(creditorId);
   try {
-    const r = await fetch(`${SIENGE_BASE_URL}/creditors/${creditorId}`, { headers: { Authorization: authHeader() } });
+    const r = await fetchSienge(`${SIENGE_BASE_URL}/creditors/${creditorId}`);
     if (!r.ok) { cacheCredores.set(creditorId, `Credor ${creditorId}`); return cacheCredores.get(creditorId); }
     const d = await r.json();
     const nome = d.name || d.tradeName || `Credor ${creditorId}`;
@@ -349,7 +364,7 @@ async function nomeCategoria(categoriaId) {
   if (!categoriaId) return null;
   if (cacheCategorias.has(categoriaId)) return cacheCategorias.get(categoriaId);
   try {
-    const r = await fetch(`${SIENGE_BASE_URL}/payment-categories/${categoriaId}`, { headers: { Authorization: authHeader() } });
+    const r = await fetchSienge(`${SIENGE_BASE_URL}/payment-categories/${categoriaId}`);
     if (!r.ok) { cacheCategorias.set(categoriaId, `${categoriaId} - Categoria`); return cacheCategorias.get(categoriaId); }
     const d = await r.json();
     const texto = `${categoriaId} - ${d.name || 'Categoria'}`;
@@ -364,7 +379,7 @@ async function obraDoTitulo(billId) {
   const chave = `bill-${billId}`;
   if (cacheEmpreendimentos.has(chave)) return cacheEmpreendimentos.get(chave);
   try {
-    const r = await fetch(`${SIENGE_BASE_URL}/bills/${billId}/buildings-cost`, { headers: { Authorization: authHeader() } });
+    const r = await fetchSienge(`${SIENGE_BASE_URL}/bills/${billId}/buildings-cost`);
     if (!r.ok) { cacheEmpreendimentos.set(chave, 'ADMINISTRATIVO'); return 'ADMINISTRATIVO'; }
     const d = await r.json();
     const nome = (d.results && d.results[0] && d.results[0].buildingName) || 'ADMINISTRATIVO';
@@ -379,7 +394,7 @@ async function obraDoRecebivel(billReceivableId) {
   const chave = `recebivel-${billReceivableId}`;
   if (cacheEmpreendimentos.has(chave)) return cacheEmpreendimentos.get(chave);
   try {
-    const r = await fetch(`${SIENGE_BASE_URL}/accounts-receivable/receivable-bills/${billReceivableId}`, { headers: { Authorization: authHeader() } });
+    const r = await fetchSienge(`${SIENGE_BASE_URL}/accounts-receivable/receivable-bills/${billReceivableId}`);
     if (!r.ok) { cacheEmpreendimentos.set(chave, 'ADMINISTRATIVO'); return 'ADMINISTRATIVO'; }
     const d = await r.json();
     const nome = d.enterpriseName || 'ADMINISTRATIVO';
@@ -423,7 +438,7 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
     let bills = [];
     while (true) {
       const url = `${SIENGE_BASE_URL}/bills?startDate=${startDate}&endDate=${endDate}&selectionType=D&limit=${limitePorPagina}&offset=${offset}`;
-      const r = await fetch(url, { headers: { Authorization: authHeader() } });
+      const r = await fetchSienge(url);
       if (!r.ok) { avisos.push(`Falha ao buscar bills: status ${r.status}`); break; }
       const dados = await r.json();
       const pagina = dados.results || [];
@@ -433,14 +448,14 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
       if (pagina.length === 0 || offset >= total) break;
     }
 
-    const TAMANHO_LOTE = 5;
+    const TAMANHO_LOTE = 3; // devagar de propósito, o Sienge bloqueia (429) se for rápido demais
     for (let i = 0; i < bills.length; i += TAMANHO_LOTE) {
       const lote = bills.slice(i, i + TAMANHO_LOTE);
       await Promise.all(lote.map(async (bill) => {
         try {
           const [rInst, rCat, credorNome, obraNome] = await Promise.all([
-            fetch(`${SIENGE_BASE_URL}/bills/${bill.id}/installments`, { headers: { Authorization: authHeader() } }),
-            fetch(`${SIENGE_BASE_URL}/bills/${bill.id}/budget-categories`, { headers: { Authorization: authHeader() } }),
+            fetchSienge(`${SIENGE_BASE_URL}/bills/${bill.id}/installments`),
+            fetchSienge(`${SIENGE_BASE_URL}/bills/${bill.id}/budget-categories`),
             nomeCredor(bill.creditorId),
             obraDoTitulo(bill.id),
           ]);
@@ -460,6 +475,7 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
           avisos.push(`Erro no título ${bill.id}: ${String(e)}`);
         }
       }));
+      await esperar(250); // respiro entre lotes para não estourar o limite do Sienge
     }
 
     // ===== CONTAS A RECEBER =====
@@ -467,7 +483,7 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
     offset = 0;
     while (true) {
       const url = `${SIENGE_BASE_URL}/customers?limit=${limitePorPagina}&offset=${offset}`;
-      const r = await fetch(url, { headers: { Authorization: authHeader() } });
+      const r = await fetchSienge(url);
       if (!r.ok) { avisos.push(`Falha ao buscar customers: status ${r.status}`); break; }
       const dados = await r.json();
       const pagina = dados.results || [];
@@ -483,7 +499,7 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
       await Promise.all(lote.map(async (cliente) => {
         const paramDoc = cliente.cnpj ? `cnpj=${cliente.cnpj}` : `cpf=${cliente.cpf}`;
         try {
-          const rSaldo = await fetch(`${SIENGE_BASE_URL}/current-debit-balance?${paramDoc}`, { headers: { Authorization: authHeader() } });
+          const rSaldo = await fetchSienge(`${SIENGE_BASE_URL}/current-debit-balance?${paramDoc}`);
           if (!rSaldo.ok) { avisos.push(`Erro no cliente ${cliente.name}: status ${rSaldo.status}`); return; }
           const dadosSaldo = await rSaldo.json();
           const contasRecebiveis = dadosSaldo.results || [];
@@ -509,6 +525,7 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
           avisos.push(`Erro no cliente ${cliente.name}: ${String(e)}`);
         }
       }));
+      await esperar(250);
     }
 
     res.json({
