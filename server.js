@@ -52,11 +52,11 @@ function esperar(ms) {
 
 // O Sienge bloqueia (status 429) quando recebe requisições rápidas demais.
 // Essa função tenta de novo, esperando um pouco mais a cada tentativa.
-async function fetchSienge(url, tentativas = 4) {
+async function fetchSienge(url, tentativas = 6) {
   for (let i = 0; i < tentativas; i++) {
     const r = await fetch(url, { headers: { Authorization: authHeader() } });
     if (r.status !== 429) return r;
-    await esperar(700 * (i + 1));
+    await esperar(1000 * (i + 1));
   }
   return fetch(url, { headers: { Authorization: authHeader() } });
 }
@@ -479,6 +479,7 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
     }
 
     // ===== CONTAS A RECEBER =====
+    await esperar(2000); // pausa maior entre as duas fases, para o limite do Sienge "resetar"
     let clientes = [];
     offset = 0;
     while (true) {
