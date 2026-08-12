@@ -27,6 +27,10 @@ const SIENGE_BASE_URL = SIENGE_SUBDOMINIO
   ? `https://api.sienge.com.br/${SIENGE_SUBDOMINIO}/public/api/v1`
   : null;
 
+const SIENGE_BULK_URL = SIENGE_SUBDOMINIO
+  ? `https://api.sienge.com.br/${SIENGE_SUBDOMINIO}/public/api/bulk-data/v1`
+  : null;
+
 const originsPermitidos = (ALLOWED_ORIGIN || '*')
   .split(',')
   .map(o => o.trim())
@@ -114,6 +118,35 @@ app.get('/api/test', async (req, res) => {
   }
 });
 
+// Teste do endpoint bulk-data /outcome (Parcelas do Contas a Pagar, com data de pagamento de verdade)
+// Uso: /api/sienge/outcome-teste?startDate=2026-09-01&endDate=2026-09-30&selectionType=D
+// selectionType: I=emissão do título, D=vencimento da parcela, P=data de pagamento, B=competência
+app.get('/api/sienge/outcome-teste', async (req, res) => {
+  if (!credenciaisOk()) {
+    return res.status(500).json({ erro: 'Variáveis de ambiente do Sienge não configuradas no Railway.' });
+  }
+  const { startDate, endDate } = req.query;
+  const selectionType = req.query.selectionType || 'D';
+  if (!startDate || !endDate) {
+    return res.status(400).json({ erro: 'Informe startDate e endDate na URL.' });
+  }
+  try {
+    const params = new URLSearchParams({
+      startDate, endDate, selectionType,
+      correctionIndexerId: '0',
+      correctionDate: endDate,
+      limit: '20',
+    });
+    const r = await fetch(`${SIENGE_BULK_URL}/outcome?${params.toString()}`, {
+      headers: { Authorization: authHeader() },
+    });
+    const texto = await r.text();
+    res.status(r.status).json({ status: r.status, ok: r.ok, resposta: safeJson(texto) });
+  } catch (err) {
+    res.status(502).json({ erro: 'Falha ao consultar bulk-data/outcome', detalhe: String(err) });
+  }
+});
+
 // ---------- Contas a Pagar completo (títulos + parcelas, pago x a pagar) ----------
 // Isso resolve o trabalho manual de abrir /bills e depois cada /bills/{id}/installments
 // um por um. Aqui o servidor já faz tudo isso e devolve pronto, uma linha por parcela.
@@ -134,7 +167,7 @@ app.get('/api/sienge/contas-pagar-completo', async (req, res) => {
     let offset = 0;
     let bills = [];
     while (true) {
-      const url = `${SIENGE_BASE_URL}/bills?startDate=${startDate}&endDate=${endDate}&selectionType=P&limit=${limitePorPagina}&offset=${offset}`;
+      const url = `${SIENGE_BASE_URL}/bills?startDate=${startDate}&endDate=${endDate}&selectionType=D&limit=${limitePorPagina}&offset=${offset}`;
       const r = await fetch(url, { headers: { Authorization: authHeader() } });
       if (!r.ok) {
         const texto = await r.text();
@@ -371,6 +404,29 @@ async function nomeCredor(creditorId) {
   }
 }
 
+// Data real de pagamento — não existe um único campo/endpoint pra isso, o Sienge espalha em
+// vários tipos de forma de pagamento. Tenta cada um em sequência e para no primeiro que existir.
+const TIPOS_PAGAMENTO = ['pix', 'bank-transfer', 'boleto-bancario', 'dda', 'boleto-concessionaria', 'boleto-tax', 'darf-tax', 'darj-tax', 'inss-tax', 'gare-tax', 'fgts-tax'];
+async function dataPagamentoReal(billId, installmentId) {
+  for (const tipo of TIPOS_PAGAMENTO) {
+    try {
+      const r = await fetchSienge(`${SIENGE_BASE_URL}/bills/${billId}/installments/${installmentId}/payment-information/${tipo}`);
+      if (r.status === 404) continue; // esse não foi o tipo usado, tenta o próximo
+      if (!r.ok) continue;
+      const d = await r.json();
+      // Procura qualquer campo que pareça uma data de pagamento (nome varia por tipo)
+      const chaveData = Object.keys(d || {}).find(k => /date/i.test(k) && (/pay|paid|transfer|effect|baixa|liquid/i.test(k) || Object.keys(d).length <= 3));
+      if (chaveData && d[chaveData]) return String(d[chaveData]).slice(0, 10);
+      // Se não achou um nome óbvio mas só tem um campo de data no objeto, usa ele
+      const qualquerData = Object.keys(d || {}).find(k => /date/i.test(k));
+      if (qualquerData && d[qualquerData]) return String(d[qualquerData]).slice(0, 10);
+    } catch {
+      // tenta o próximo tipo
+    }
+  }
+  return null; // não achou em nenhum tipo — provavelmente baixa manual sem esses dados, ou outro motivo
+}
+
 async function nomeCategoria(categoriaId) {
   if (!categoriaId) return null;
   if (cacheCategorias.has(categoriaId)) return cacheCategorias.get(categoriaId);
@@ -447,11 +503,15 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
 
   try {
     // ===== CONTAS A PAGAR =====
+    // Busca títulos com uma janela de EMISSÃO bem mais larga que o período pedido — muita fatura de
+    // obra é emitida bem antes do vencimento das parcelas. O filtro fino pelo período pedido acontece
+    // depois, parcela por parcela, usando a data de vencimento de cada uma (não a emissão do título).
     const limitePorPagina = 100;
     let offset = 0;
     let bills = [];
+    const dataEmissaoMinima = startDate < '2000-01-01' ? startDate : '2000-01-01'; // nunca fica mais "curto" que o período pedido pelo usuário
     while (true) {
-      const url = `${SIENGE_BASE_URL}/bills?startDate=${startDate}&endDate=${endDate}&selectionType=P&limit=${limitePorPagina}&offset=${offset}`;
+      const url = `${SIENGE_BASE_URL}/bills?startDate=${dataEmissaoMinima}&endDate=${endDate}&selectionType=D&limit=${limitePorPagina}&offset=${offset}`;
       const r = await fetchSienge(url);
       if (!r.ok) { avisos.push(`Falha ao buscar bills: status ${r.status}`); break; }
       const dados = await r.json();
@@ -464,14 +524,24 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
 
     const debugAtivo = req.query.debug === '1';
     const debugInfo = [];
+    const buscarDataPagamentoReal = req.query.dataPagamentoReal === '1';
 
     const TAMANHO_LOTE = 3; // devagar de propósito, o Sienge bloqueia (429) se for rápido demais
     for (let i = 0; i < bills.length; i += TAMANHO_LOTE) {
       const lote = bills.slice(i, i + TAMANHO_LOTE);
       await Promise.all(lote.map(async (bill) => {
         try {
-          const [rInst, rCat, credorNome, obraNome] = await Promise.all([
-            fetchSienge(`${SIENGE_BASE_URL}/bills/${bill.id}/installments`),
+          const rInst = await fetchSienge(`${SIENGE_BASE_URL}/bills/${bill.id}/installments`);
+          const instData = rInst.ok ? await rInst.json() : { results: [] };
+          const installments = (instData.results || []).filter((inst) => {
+            const pago = inst.situation === 'Totalmente paga';
+            if (pago && buscarDataPagamentoReal) return true; // ainda não sabemos a data real de pagamento — decide depois de consultar
+            const dataRef = inst.dueDate || bill.issueDate;
+            return dataRef && dataRef >= startDate && dataRef <= endDate; // parcela em aberto: filtra já pelo vencimento
+          });
+          if (!installments.length) return; // nenhuma parcela desse título é candidata ao período — não vale a pena consultar credor/categoria/obra
+
+          const [rCat, credorNome, obraNome] = await Promise.all([
             fetchSienge(`${SIENGE_BASE_URL}/bills/${bill.id}/budget-categories`),
             nomeCredor(bill.creditorId),
             obraDoTitulo(bill.id),
@@ -485,8 +555,6 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
               debugInfo.push({ billId: bill.id, erroDebug: String(eDebug) });
             }
           }
-          const instData = rInst.ok ? await rInst.json() : { results: [] };
-          const installments = instData.results || [];
           const catData = rCat.ok ? await rCat.json() : { results: [] };
           const categoriaId = (catData.results && catData.results[0] && catData.results[0].paymentCategoriesId) || null;
           let contaTexto = categoriaId ? await nomeCategoria(categoriaId) : `${bill.documentIdentificationId || 'SEM CATEGORIA'}`;
@@ -494,12 +562,19 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
           let obraFinal = obraNome;
           if (obraFinal === null) { obraFinal = 'FALHA NA CONSULTA (sincronize de novo)'; avisos.push(`Falha ao buscar obra do título ${bill.id} — linha marcada, sincronize de novo`); }
 
-          installments.forEach((inst) => {
+          for (const inst of installments) {
+            let dataRef = inst.dueDate || bill.issueDate;
             const pago = inst.situation === 'Totalmente paga';
             const prefixo = pago ? 'Pagamento' : 'A pagar';
-            const dataRef = inst.dueDate || bill.issueDate;
+            const idParcela = inst.installmentId ?? inst.indexId ?? inst.installmentNumber;
+            if (pago && buscarDataPagamentoReal) {
+              const dataReal = idParcela != null ? await dataPagamentoReal(bill.id, idParcela) : null;
+              if (dataReal) dataRef = dataReal;
+              // só entra se a data (real, ou vencimento se não achou a real) cair mesmo no período pedido
+              if (!dataRef || dataRef < startDate || dataRef > endDate) continue;
+            }
             linhas.push(linhaCsv(dataRef, `${prefixo} - ${credorNome}`, inst.amount, obraFinal, contaTexto, 'PAGAMENTO'));
-          });
+          }
         } catch (e) {
           avisos.push(`Erro no título ${bill.id}: ${String(e)}`);
         }
