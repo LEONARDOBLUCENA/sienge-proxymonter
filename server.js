@@ -524,6 +524,7 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
         registros = registros.concat(pagina);
         if (pagina.length < limit) break;
         offset += limit;
+        await esperar(300); // respiro entre páginas — evita bloqueio em períodos grandes com muitas páginas
       }
       return registros;
     }
