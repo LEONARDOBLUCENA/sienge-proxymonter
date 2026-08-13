@@ -540,6 +540,7 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
 
     // Vencimento (D) — só interessa quem AINDA TEM SALDO em aberto (vira "A pagar")
     const registrosD = await buscarOutcome('D');
+    await esperar(1500); // respiro antes da segunda busca
     registrosD.forEach((rec) => {
       const saldo = rec.correctedBalanceAmount ?? rec.balanceAmount ?? 0;
       if (!saldo || saldo <= 0) return; // já foi totalmente pago — o pagamento entra pela busca de pagamento (P)
