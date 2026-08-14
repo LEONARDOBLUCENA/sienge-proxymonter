@@ -16,10 +16,10 @@ app.use(express.json());
 
 // ---------- Configuração ----------
 const {
-  SIENGE_SUBDOMINIO,   // ex: "monter" -> https://api.sienge.com.br/monter/public/api/v1
+  SIENGE_SUBDOMINIO,   // ex: "solucioneimoveis" -> https://api.sienge.com.br/solucioneimoveis/public/api/v1
   SIENGE_USUARIO,      // usuário de integração cadastrado no Sienge
   SIENGE_SENHA,        // senha do usuário de integração
-  ALLOWED_ORIGIN,       // ex: https://leonardoblucena.github.io (separar por vírgula se mais de um)
+  ALLOWED_ORIGIN,      // ex: https://leonardoblucena.github.io (separar por vírgula se mais de um)
   PORT
 } = process.env;
 
@@ -55,7 +55,8 @@ function esperar(ms) {
 }
 
 // O Sienge bloqueia (status 429) quando recebe requisições rápidas demais.
-// Essa função tenta de novo, esperando um pouco mais a cada tentativa.
+// Essa função tenta de novo, esperando um pouco mais a cada tentativa (com uma variação
+// aleatória, pra evitar que chamadas em paralelo tentem de novo todas no mesmo instante).
 async function fetchSienge(url, tentativas = 8) {
   for (let i = 0; i < tentativas; i++) {
     const r = await fetch(url, { headers: { Authorization: authHeader() } });
@@ -64,6 +65,10 @@ async function fetchSienge(url, tentativas = 8) {
     await esperar(1200 * (i + 1) + jitter);
   }
   return fetch(url, { headers: { Authorization: authHeader() } });
+}
+
+function safeJson(texto) {
+  try { return JSON.parse(texto); } catch { return texto; }
 }
 
 // ---------- Rotas de diagnóstico ----------
@@ -80,12 +85,11 @@ app.get('/', (req, res) => {
 // Healthcheck simples (Railway usa isso para saber se o deploy está saudável)
 app.get('/health', (req, res) => res.status(200).send('ok'));
 
-// Limpa o cache de fornecedores/categorias/obras guardado em memória — útil se algum
-// resultado errado tiver ficado guardado (ex: por causa de um bloqueio 429 no meio de uma sincronização)
+// Cache de obra por recebível (usado em Contas a Receber) — guardado em memória enquanto
+// o servidor está no ar. Essa rota limpa esse cache, útil se algum resultado errado tiver
+// ficado guardado (ex: por causa de um bloqueio 429 no meio de uma sincronização).
 app.get('/api/limpar-cache', (req, res) => {
-  const antes = { credores: cacheCredores.size, categorias: cacheCategorias.size, empreendimentos: cacheEmpreendimentos.size };
-  cacheCredores.clear();
-  cacheCategorias.clear();
+  const antes = { empreendimentos: cacheEmpreendimentos.size };
   cacheEmpreendimentos.clear();
   res.json({ ok: true, limpo: antes });
 });
@@ -118,354 +122,39 @@ app.get('/api/test', async (req, res) => {
   }
 });
 
-// Teste do endpoint bulk-data /outcome (Parcelas do Contas a Pagar, com data de pagamento de verdade)
-// Uso: /api/sienge/outcome-teste?startDate=2026-09-01&endDate=2026-09-30&selectionType=D
-// selectionType: I=emissão do título, D=vencimento da parcela, P=data de pagamento, B=competência
-app.get('/api/sienge/outcome-teste', async (req, res) => {
-  if (!credenciaisOk()) {
-    return res.status(500).json({ erro: 'Variáveis de ambiente do Sienge não configuradas no Railway.' });
-  }
-  const { startDate, endDate } = req.query;
-  const selectionType = req.query.selectionType || 'D';
-  if (!startDate || !endDate) {
-    return res.status(400).json({ erro: 'Informe startDate e endDate na URL.' });
-  }
-  try {
-    const params = new URLSearchParams({
-      startDate, endDate, selectionType,
-      correctionIndexerId: '0',
-      correctionDate: endDate,
-      limit: '20',
-    });
-    const r = await fetch(`${SIENGE_BULK_URL}/outcome?${params.toString()}`, {
-      headers: { Authorization: authHeader() },
-    });
-    const texto = await r.text();
-    res.status(r.status).json({ status: r.status, ok: r.ok, resposta: safeJson(texto) });
-  } catch (err) {
-    res.status(502).json({ erro: 'Falha ao consultar bulk-data/outcome', detalhe: String(err) });
-  }
-});
-
-// ---------- Contas a Pagar completo (títulos + parcelas, pago x a pagar) ----------
-// Isso resolve o trabalho manual de abrir /bills e depois cada /bills/{id}/installments
-// um por um. Aqui o servidor já faz tudo isso e devolve pronto, uma linha por parcela.
-//
-// Uso: /api/sienge/contas-pagar-completo?startDate=2026-01-01&endDate=2026-01-31
-app.get('/api/sienge/contas-pagar-completo', async (req, res) => {
-  if (!credenciaisOk()) {
-    return res.status(500).json({ erro: 'Variáveis de ambiente do Sienge não configuradas no Railway.' });
-  }
-  const { startDate, endDate } = req.query;
-  if (!startDate || !endDate) {
-    return res.status(400).json({ erro: 'Informe startDate e endDate na URL, formato AAAA-MM-DD. Ex: ?startDate=2026-01-01&endDate=2026-01-31' });
-  }
-
-  try {
-    // 1) Busca todos os títulos (bills) do período, paginando (a API devolve no máximo 100/200 por vez)
-    const limitePorPagina = 100;
-    let offset = 0;
-    let bills = [];
-    while (true) {
-      const url = `${SIENGE_BASE_URL}/bills?startDate=${startDate}&endDate=${endDate}&selectionType=D&limit=${limitePorPagina}&offset=${offset}`;
-      const r = await fetch(url, { headers: { Authorization: authHeader() } });
-      if (!r.ok) {
-        const texto = await r.text();
-        return res.status(r.status).json({ erro: 'Falha ao buscar títulos (bills)', resposta: safeJson(texto) });
-      }
-      const dados = await r.json();
-      const pagina = dados.results || [];
-      bills = bills.concat(pagina);
-      const total = (dados.resultSetMetadata && dados.resultSetMetadata.count) || 0;
-      offset += limitePorPagina;
-      if (pagina.length === 0 || offset >= total) break;
-    }
-
-    // 2) Para cada título, busca as parcelas (installments) — em lotes, para não sobrecarregar a API do Sienge
-    const TAMANHO_LOTE = 5;
-    const comInstallments = [];
-    for (let i = 0; i < bills.length; i += TAMANHO_LOTE) {
-      const lote = bills.slice(i, i + TAMANHO_LOTE);
-      const respostasLote = await Promise.all(lote.map(async (bill) => {
-        try {
-          const rInst = await fetch(`${SIENGE_BASE_URL}/bills/${bill.id}/installments`, {
-            headers: { Authorization: authHeader() },
-          });
-          if (!rInst.ok) return { bill, installments: [], erroParcelas: `status ${rInst.status}` };
-          const dadosInst = await rInst.json();
-          const installments = Array.isArray(dadosInst) ? dadosInst : (dadosInst.results || []);
-          return { bill, installments };
-        } catch (e) {
-          return { bill, installments: [], erroParcelas: String(e) };
-        }
-      }));
-      comInstallments.push(...respostasLote);
-    }
-
-    // 3) Achata tudo em uma lista simples: uma linha por parcela, já classificada
-    const parcelas = [];
-    comInstallments.forEach(({ bill, installments, erroParcelas }) => {
-      if (!installments.length) {
-        parcelas.push({
-          billId: bill.id,
-          documentNumber: bill.documentNumber,
-          documentIdentificationId: bill.documentIdentificationId,
-          creditorId: bill.creditorId,
-          debtorId: bill.debtorId,
-          issueDate: bill.issueDate,
-          totalInvoiceAmount: bill.totalInvoiceAmount,
-          erroParcelas: erroParcelas || 'Sem parcelas retornadas',
-        });
-        return;
-      }
-      installments.forEach((inst) => {
-        // Campos de saldo/valor variam um pouco conforme a API do Sienge — mantemos o "raw"
-        // para você conferir os nomes exatos e eu ajustar aqui se precisar.
-        const saldo = inst.balanceAmount ?? inst.currentBalance ?? null;
-        const pago = saldo !== null ? saldo <= 0 : (inst.status === 'paid' || inst.status === 2 || inst.status === 3);
-        parcelas.push({
-          billId: bill.id,
-          documentNumber: bill.documentNumber,
-          documentIdentificationId: bill.documentIdentificationId,
-          creditorId: bill.creditorId,
-          debtorId: bill.debtorId,
-          issueDate: bill.issueDate,
-          installmentId: inst.id ?? inst.installmentId,
-          dueDate: inst.dueDate,
-          amount: inst.amount ?? inst.originalValue ?? null,
-          balance: saldo,
-          pago,
-          raw: inst,
-        });
-      });
-    });
-
-    res.json({
-      status: 200,
-      ok: true,
-      periodo: { startDate, endDate },
-      totalTitulos: bills.length,
-      totalParcelas: parcelas.length,
-      resultados: parcelas,
-    });
-  } catch (err) {
-    res.status(502).json({ erro: 'Falha ao montar contas a pagar completo', detalhe: String(err) });
-  }
-});
-
-// ---------- Contas a Receber completo (clientes + parcelas, recebido x a receber) ----------
-// Busca todos os clientes e, para cada um, consulta o saldo devedor (que já traz as
-// parcelas pagas e as parcelas em aberto). Devolve tudo achatado, uma linha por parcela.
-//
-// Uso: /api/sienge/contas-receber-completo
-app.get('/api/sienge/contas-receber-completo', async (req, res) => {
-  if (!credenciaisOk()) {
-    return res.status(500).json({ erro: 'Variáveis de ambiente do Sienge não configuradas no Railway.' });
-  }
-
-  try {
-    // 1) Busca todos os clientes, paginando
-    const limitePorPagina = 100;
-    let offset = 0;
-    let clientes = [];
-    while (true) {
-      const url = `${SIENGE_BASE_URL}/customers?limit=${limitePorPagina}&offset=${offset}`;
-      const r = await fetch(url, { headers: { Authorization: authHeader() } });
-      if (!r.ok) {
-        const texto = await r.text();
-        return res.status(r.status).json({ erro: 'Falha ao buscar clientes (customers)', resposta: safeJson(texto) });
-      }
-      const dados = await r.json();
-      const pagina = dados.results || [];
-      clientes = clientes.concat(pagina);
-      const total = (dados.resultSetMetadata && dados.resultSetMetadata.count) || 0;
-      offset += limitePorPagina;
-      if (pagina.length === 0 || offset >= total) break;
-    }
-
-    // Só interessam os clientes que têm CPF ou CNPJ (current-debit-balance exige um dos dois)
-    const clientesComDocumento = clientes.filter(c => c.cpf || c.cnpj);
-
-    // 2) Para cada cliente, busca o saldo devedor presente (em lotes, para não sobrecarregar o Sienge)
-    const TAMANHO_LOTE = 5;
-    const comSaldo = [];
-    for (let i = 0; i < clientesComDocumento.length; i += TAMANHO_LOTE) {
-      const lote = clientesComDocumento.slice(i, i + TAMANHO_LOTE);
-      const respostasLote = await Promise.all(lote.map(async (cliente) => {
-        const paramDoc = cliente.cnpj ? `cnpj=${cliente.cnpj}` : `cpf=${cliente.cpf}`;
-        try {
-          const rSaldo = await fetch(`${SIENGE_BASE_URL}/current-debit-balance?${paramDoc}`, {
-            headers: { Authorization: authHeader() },
-          });
-          if (!rSaldo.ok) return { cliente, contas: [], erroSaldo: `status ${rSaldo.status}` };
-          const dadosSaldo = await rSaldo.json();
-          const contas = dadosSaldo.results || [];
-          return { cliente, contas };
-        } catch (e) {
-          return { cliente, contas: [], erroSaldo: String(e) };
-        }
-      }));
-      comSaldo.push(...respostasLote);
-    }
-
-    // 3) Achata tudo em uma lista simples: uma linha por parcela, já classificada
-    const parcelas = [];
-    comSaldo.forEach(({ cliente, contas, erroSaldo }) => {
-      if (erroSaldo) {
-        parcelas.push({
-          customerId: cliente.id,
-          customerName: cliente.name,
-          erroSaldo,
-        });
-        return;
-      }
-      contas.forEach((conta) => {
-        (conta.paidInstallments || []).forEach((inst) => {
-          parcelas.push({
-            customerId: cliente.id,
-            customerName: cliente.name,
-            billReceivableId: conta.billReceivableId,
-            documentId: conta.documentId,
-            installmentId: inst.installmentId,
-            dueDate: inst.dueDate,
-            originalValue: inst.originalValue,
-            adjustedValue: inst.adjustedValue,
-            recebido: true,
-            recibos: inst.receipts || [],
-          });
-        });
-        (conta.payableInstallments || []).forEach((inst) => {
-          parcelas.push({
-            customerId: cliente.id,
-            customerName: cliente.name,
-            billReceivableId: conta.billReceivableId,
-            documentId: conta.documentId,
-            installmentId: inst.installmentId,
-            dueDate: inst.dueDate,
-            originalValue: inst.originalValue,
-            adjustedValue: inst.adjustedValue,
-            currentBalance: inst.currentBalance,
-            recebido: false,
-          });
-        });
-      });
-    });
-
-    res.json({
-      status: 200,
-      ok: true,
-      totalClientes: clientesComDocumento.length,
-      totalParcelas: parcelas.length,
-      resultados: parcelas,
-    });
-  } catch (err) {
-    res.status(502).json({ erro: 'Falha ao montar contas a receber completo', detalhe: String(err) });
-  }
-});
-
 // ---------- Sync completo: devolve linhas prontas no formato DATA.csv do BI ----------
 // Junta Contas a Pagar e Contas a Receber, já mapeados para {data, complemento, valor, cc, conta, tipo, mes, ano}.
-// Isso é o que o botão "Sync Sienge" do BI vai chamar.
+// Isso é o que o botão "Sync Sienge" do BI chama.
 //
 // Uso: /api/sienge/sync-completo?startDate=2026-01-01&endDate=2026-01-31
 //
-// Mapeamento de Contas a Receber (não tem plano financeiro, só um código de documento):
-//   CT  -> 10101 - Receita de Incorporação de Imóveis (venda de imóvel)
-//   EMP -> 10501 - Empréstimos
-//   REC, FAT, outros -> 10201 - Receita de Prestação de Serviço
+// Contas a Pagar vem da API Bulk Data /outcome (bem mais rápida que ir título por título):
+//   selectionType=D (vencimento) -> parcelas com saldo em aberto = "A pagar"
+//   selectionType=P (data de pagamento) -> pagamentos de verdade, na data real = "Pagamento"
+// Já traz fornecedor, obra (costCenterName) e conta financeira (financialCategory) prontos.
+//
+// Contas a Receber vem de /current-debit-balance por cliente (não tem endpoint Bulk Data
+// equivalente conhecido) — não tem um "plano financeiro" como o Contas a Pagar, só um
+// código de documento (CT/EMP/REC/FAT/...), mapeado abaixo:
 const MAPA_CONTA_RECEBER = {
   CT: '10101 - Receita de Incorporação de Imóveis',
   EMP: '10501 - Empréstimos',
 };
 const CONTA_RECEBER_PADRAO = '10201 - Receita de Prestação de Serviço';
-
 function contaDeRecebivel(documentId) {
   return MAPA_CONTA_RECEBER[documentId] || CONTA_RECEBER_PADRAO;
 }
 
-// Caches simples em memória (duram enquanto o servidor está no ar) — evitam repetir
-// chamadas ao Sienge para o mesmo fornecedor/conta/obra dentro da mesma sincronização.
-const cacheCredores = new Map();
-const cacheCategorias = new Map();
+// Cache em memória de obra por recebível — evita repetir a mesma consulta várias vezes
+// dentro da mesma sincronização (um cliente pode ter várias parcelas do mesmo recebível).
 const cacheEmpreendimentos = new Map();
-
-async function nomeCredor(creditorId) {
-  if (!creditorId) return 'Fornecedor não identificado';
-  if (cacheCredores.has(creditorId)) return cacheCredores.get(creditorId);
-  try {
-    const r = await fetchSienge(`${SIENGE_BASE_URL}/creditors/${creditorId}`);
-    if (!r.ok) { cacheCredores.set(creditorId, `Credor ${creditorId}`); return cacheCredores.get(creditorId); }
-    const d = await r.json();
-    const nome = d.name || d.tradeName || `Credor ${creditorId}`;
-    cacheCredores.set(creditorId, nome);
-    return nome;
-  } catch {
-    return `Credor ${creditorId}`;
-  }
-}
-
-// Data real de pagamento — não existe um único campo/endpoint pra isso, o Sienge espalha em
-// vários tipos de forma de pagamento. Tenta cada um em sequência e para no primeiro que existir.
-const TIPOS_PAGAMENTO = ['pix', 'bank-transfer', 'boleto-bancario', 'dda', 'boleto-concessionaria', 'boleto-tax', 'darf-tax', 'darj-tax', 'inss-tax', 'gare-tax', 'fgts-tax'];
-async function dataPagamentoReal(billId, installmentId) {
-  for (const tipo of TIPOS_PAGAMENTO) {
-    try {
-      const r = await fetchSienge(`${SIENGE_BASE_URL}/bills/${billId}/installments/${installmentId}/payment-information/${tipo}`);
-      if (r.status === 404) continue; // esse não foi o tipo usado, tenta o próximo
-      if (!r.ok) continue;
-      const d = await r.json();
-      // Procura qualquer campo que pareça uma data de pagamento (nome varia por tipo)
-      const chaveData = Object.keys(d || {}).find(k => /date/i.test(k) && (/pay|paid|transfer|effect|baixa|liquid/i.test(k) || Object.keys(d).length <= 3));
-      if (chaveData && d[chaveData]) return String(d[chaveData]).slice(0, 10);
-      // Se não achou um nome óbvio mas só tem um campo de data no objeto, usa ele
-      const qualquerData = Object.keys(d || {}).find(k => /date/i.test(k));
-      if (qualquerData && d[qualquerData]) return String(d[qualquerData]).slice(0, 10);
-    } catch {
-      // tenta o próximo tipo
-    }
-  }
-  return null; // não achou em nenhum tipo — provavelmente baixa manual sem esses dados, ou outro motivo
-}
-
-async function nomeCategoria(categoriaId) {
-  if (!categoriaId) return null;
-  if (cacheCategorias.has(categoriaId)) return cacheCategorias.get(categoriaId);
-  try {
-    const r = await fetchSienge(`${SIENGE_BASE_URL}/payment-categories/${categoriaId}`);
-    if (r.status === 404) { const t=`${categoriaId} - Categoria não encontrada`; cacheCategorias.set(categoriaId, t); return t; }
-    if (!r.ok) return null; // falha real (ex: 429 persistente) — não assume, não cacheia
-    const d = await r.json();
-    const texto = `${categoriaId} - ${d.name || 'Categoria'}`;
-    cacheCategorias.set(categoriaId, texto);
-    return texto;
-  } catch {
-    return null;
-  }
-}
-
-async function obraDoTitulo(billId) {
-  const chave = `bill-${billId}`;
-  if (cacheEmpreendimentos.has(chave)) return cacheEmpreendimentos.get(chave);
-  try {
-    const r = await fetchSienge(`${SIENGE_BASE_URL}/bills/${billId}/buildings-cost`);
-    if (r.status === 404) { cacheEmpreendimentos.set(chave, 'ADMINISTRATIVO'); return 'ADMINISTRATIVO'; } // confirmado: sem obra vinculada
-    if (!r.ok) return null; // falha real na consulta — não assume ADMINISTRATIVO
-    const d = await r.json();
-    const nome = (d.results && d.results[0] && d.results[0].buildingName) || 'ADMINISTRATIVO';
-    cacheEmpreendimentos.set(chave, nome);
-    return nome;
-  } catch {
-    return null;
-  }
-}
-
 async function obraDoRecebivel(billReceivableId) {
   const chave = `recebivel-${billReceivableId}`;
   if (cacheEmpreendimentos.has(chave)) return cacheEmpreendimentos.get(chave);
   try {
     const r = await fetchSienge(`${SIENGE_BASE_URL}/accounts-receivable/receivable-bills/${billReceivableId}`);
     if (r.status === 404) { cacheEmpreendimentos.set(chave, 'ADMINISTRATIVO'); return 'ADMINISTRATIVO'; }
-    if (!r.ok) return null;
+    if (!r.ok) return null; // falha real na consulta (ex: 429 persistente) — não assume ADMINISTRATIVO
     const d = await r.json();
     const nome = d.enterpriseName || 'ADMINISTRATIVO';
     cacheEmpreendimentos.set(chave, nome);
@@ -500,11 +189,10 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
 
   const linhas = [];
   const avisos = [];
+  const debugAtivo = req.query.debug === '1';
 
   try {
-    // ===== CONTAS A PAGAR (via bulk-data /outcome — já traz fornecedor, obra e categoria prontos) =====
-    const debugAtivo = req.query.debug === '1';
-
+    // ===== CONTAS A PAGAR (via bulk-data /outcome) =====
     async function buscarOutcome(tipoSelecao) {
       let offset = 0;
       const limit = 200;
@@ -624,7 +312,6 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
       periodo: { startDate, endDate },
       totalLinhas: linhas.length,
       avisos,
-      debug: undefined,
       csv: linhas,
     });
   } catch (err) {
@@ -633,10 +320,9 @@ app.get('/api/sienge/sync-completo', async (req, res) => {
 });
 
 // ---------- Proxy genérico ----------
-// Encaminha qualquer caminho para a API do Sienge, adicionando a autenticação no servidor.
-// Exemplo de uso no front-end:
-//   fetch('https://sienge-proxymonter.up.railway.app/api/sienge/income?limit=200')
-//   fetch('https://sienge-proxymonter.up.railway.app/api/sienge/bills?startDate=2026-01-01&endDate=2026-01-31')
+// Encaminha qualquer caminho para a API REST "normal" do Sienge (v1), adicionando a
+// autenticação no servidor. Útil para testar/explorar endpoints pontualmente.
+// Exemplo: /api/sienge/bills?startDate=2026-01-01&endDate=2026-01-31
 app.get('/api/sienge/*', async (req, res) => {
   if (!credenciaisOk()) {
     return res.status(500).json({ erro: 'Variáveis de ambiente do Sienge não configuradas no Railway.' });
@@ -656,10 +342,6 @@ app.get('/api/sienge/*', async (req, res) => {
     res.status(502).json({ erro: 'Falha ao consultar a API do Sienge', detalhe: String(err) });
   }
 });
-
-function safeJson(texto) {
-  try { return JSON.parse(texto); } catch { return texto; }
-}
 
 const porta = PORT || 3000;
 app.listen(porta, () => {
