@@ -292,15 +292,15 @@ app.get('/api/sienge/sync-contas-a-receber', async (req, res) => {
     }, avisos, 'income (Contas a Receber)');
 
     registros.forEach((rec) => {
-      const jaRecebido = rec.payments && rec.payments.length > 0;
+      const jaRecebido = rec.receipts && rec.receipts.length > 0;
       if (jaRecebido) return; // só o pendente entra nessa aba
       const saldo = rec.correctedBalanceAmount ?? rec.balanceAmount ?? 0;
       if (!saldo || saldo <= 0) return;
       if (!rec.dueDate) return;
-      const cliente = rec.customerName || rec.creditorName || 'Cliente não identificado';
-      const cat = (rec.paymentsCategories && rec.paymentsCategories[0]) || null;
+      const cliente = rec.clientName || rec.creditorName || 'Cliente não identificado';
+      const cat = (rec.receiptsCategories && rec.receiptsCategories[0]) || null;
       const cc = (cat && cat.costCenterName) || 'ADMINISTRATIVO';
-      const conta = categoriaFinanceira(cat) || contaDeRecebivelFallback(rec.documentId);
+      const conta = categoriaFinanceira(cat) || contaDeRecebivelFallback(rec.documentIdentificationId || rec.documentId);
       linhas.push(linhaCsv(rec.dueDate, `A receber - ${cliente}`, saldo, cc, conta, 'FATURAMENTO'));
     });
 
