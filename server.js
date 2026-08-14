@@ -258,6 +258,47 @@ app.get('/api/sienge/sync-contas-pagas', async (req, res) => {
   }
 });
 
+// ---------- CONTAS A PAGAR (provisão / pendente) — /outcome ----------
+// GET /outcome?startDate=&endDate=&selectionType=D&correctionIndexerId=0&correctionDate={endDate}
+//   Aqui só entram os registros que AINDA TÊM SALDO em aberto — o já pago fica de fora
+//   dessa aba de propósito (isso é a aba "Contas Pagas", vinda de selectionType=P).
+//
+// Uso: /api/sienge/sync-contas-a-pagar?startDate=2026-07-01&endDate=2026-07-31
+app.get('/api/sienge/sync-contas-a-pagar', async (req, res) => {
+  if (!credenciaisOk()) {
+    return res.status(500).json({ erro: 'Variáveis de ambiente do Sienge não configuradas no Railway.' });
+  }
+  const { startDate, endDate } = req.query;
+  if (!startDate || !endDate) {
+    return res.status(400).json({ erro: 'Informe startDate e endDate na URL, formato AAAA-MM-DD.' });
+  }
+
+  const linhas = [];
+  const avisos = [];
+
+  try {
+    const registros = await buscarBulkData('outcome', {
+      startDate, endDate, selectionType: 'D', correctionIndexerId: '0', correctionDate: endDate,
+    }, avisos, 'outcome (Contas a Pagar)');
+
+    registros.forEach((rec) => {
+      const saldo = rec.correctedBalanceAmount ?? rec.balanceAmount ?? 0;
+      if (!saldo || saldo <= 0) return; // já foi totalmente pago — entra pela aba Contas Pagas
+      if (!rec.dueDate) return;
+      const credorNome = rec.creditorName || 'Fornecedor não identificado';
+      const bc = (rec.buildingsCosts && rec.buildingsCosts[0]) || null;
+      const cat = (rec.paymentsCategories && rec.paymentsCategories[0]) || null;
+      const cc = (bc && bc.buildingName) || (cat && cat.costCenterName) || 'ADMINISTRATIVO';
+      const conta = categoriaFinanceira(cat) || 'SEM CATEGORIA';
+      linhas.push(linhaCsv(rec.dueDate, `A pagar - ${credorNome}`, saldo, cc, conta, 'PAGAMENTO'));
+    });
+
+    res.json({ status: 200, ok: true, periodo: { startDate, endDate }, totalLinhas: linhas.length, avisos, csv: linhas });
+  } catch (err) {
+    res.status(502).json({ erro: 'Falha ao montar sincronização de Contas a Pagar', detalhe: String(err), avisos });
+  }
+});
+
 // ---------- CONTAS A RECEBER (provisão / pendente) — /income ----------
 // GET /income?startDate=&endDate=&selectionType=D&correctionIndexerId=0&correctionDate={endDate}
 //   payments[].operationTypeId aceito: 1, 2, 11 (só relevante se um dia formos trazer os já recebidos)
