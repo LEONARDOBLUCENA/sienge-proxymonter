@@ -137,6 +137,25 @@ app.get('/api/test', async (req, res) => {
   }
 });
 
+// Rota de teste genérica pra qualquer recurso da API Bulk Data — mostra o registro cru,
+// sem nenhum mapeamento, pra conferir os nomes reais dos campos antes de programar.
+// Uso: /api/sienge/bulk-teste/income?startDate=2026-07-01&endDate=2026-07-31&selectionType=D&correctionIndexerId=0&correctionDate=2026-07-31
+app.get('/api/sienge/bulk-teste/:recurso', async (req, res) => {
+  if (!credenciaisOk()) {
+    return res.status(500).json({ erro: 'Variáveis de ambiente do Sienge não configuradas no Railway.' });
+  }
+  const { recurso } = req.params;
+  const params = new URLSearchParams(req.query);
+  if (!params.has('limit')) params.set('limit', '3');
+  try {
+    const r = await fetch(`${SIENGE_BULK_URL}/${recurso}?${params.toString()}`, { headers: { Authorization: authHeader() } });
+    const texto = await r.text();
+    res.status(r.status).json({ status: r.status, ok: r.ok, resposta: safeJson(texto) });
+  } catch (err) {
+    res.status(502).json({ erro: 'Falha ao consultar bulk-data', detalhe: String(err) });
+  }
+});
+
 // ---------- CONTAS PAGAS (Saídas) — /outcome + /bank-movement (avulsos somados) ----------
 // GET /outcome?startDate=&endDate=&selectionType=P&correctionIndexerId=0&correctionDate={endDate}
 //   payments[].operationTypeId aceito: 1, 2, 10, 11
