@@ -227,6 +227,11 @@ app.get('/api/sienge/sync-contas-pagas', async (req, res) => {
     registrosBanco.forEach((rec) => {
       if (rec.bankMovementOperationType !== 'S') return;
       if (!rec.bankMovementDate) return;
+      // Transferência entre contas da própria empresa — não é despesa nem receita real, ignora.
+      // Identificado por não ter fornecedor/cliente nenhum E o histórico mencionar "transferência".
+      const semContraparte = !rec.creditorName && !rec.clientName;
+      const historicoTransferencia = /transfer[eê]ncia/i.test(rec.bankMovementHistoricName || '');
+      if (semContraparte && historicoTransferencia) return;
       const valorTotal = rec.bankMovementAmount ?? 0;
       const nome = rec.creditorName || rec.clientName || rec.bankMovementHistoricName || 'Movimento avulso';
       const complemento = `Pagamento - ${nome}`;
