@@ -303,11 +303,29 @@ app.get('/api/sienge/sync-contas-a-pagar', async (req, res) => {
       if (!saldo || saldo <= 0) return; // já foi totalmente pago — entra pela aba Contas Pagas
       if (!rec.dueDate) return;
       const credorNome = rec.creditorName || 'Fornecedor não identificado';
-      const bc = (rec.buildingsCosts && rec.buildingsCosts[0]) || null;
-      const cat = (rec.paymentsCategories && rec.paymentsCategories[0]) || null;
-      const cc = (bc && bc.buildingName) || (cat && cat.costCenterName) || 'ADMINISTRATIVO';
-      const conta = categoriaFinanceira(cat) || 'SEM CATEGORIA';
-      linhas.push(linhaCsv(rec.dueDate, `A pagar - ${credorNome}`, saldo, cc, conta, 'PAGAMENTO'));
+      const complemento = `A pagar - ${credorNome}`;
+      const buildingsCosts = rec.buildingsCosts || [];
+      const paymentsCategories = rec.paymentsCategories || [];
+      // Título pode estar rateado entre mais de uma obra — uma linha por item do rateio,
+      // cada uma com sua fatia proporcional do saldo (rate). Antes só pegava o item [0]
+      // e jogava o saldo inteiro nele, distorcendo o custo por obra em títulos rateados.
+      if (buildingsCosts.length) {
+        buildingsCosts.forEach((bc, idx) => {
+          const rate = bc.rate != null ? bc.rate : (100 / buildingsCosts.length);
+          const valor = saldo * (rate / 100);
+          const cat = paymentsCategories[idx] || paymentsCategories[0] || null;
+          const conta = categoriaFinanceira(cat) || 'SEM CATEGORIA';
+          linhas.push(linhaCsv(rec.dueDate, complemento, valor, bc.buildingName || 'ADMINISTRATIVO', conta, 'PAGAMENTO'));
+        });
+      } else if (paymentsCategories.length) {
+        paymentsCategories.forEach((cat) => {
+          const rate = cat.rate != null ? cat.rate : (100 / paymentsCategories.length);
+          const valor = saldo * (rate / 100);
+          linhas.push(linhaCsv(rec.dueDate, complemento, valor, cat.costCenterName || 'ADMINISTRATIVO', categoriaFinanceira(cat) || 'SEM CATEGORIA', 'PAGAMENTO'));
+        });
+      } else {
+        linhas.push(linhaCsv(rec.dueDate, complemento, saldo, 'ADMINISTRATIVO', 'SEM CATEGORIA', 'PAGAMENTO'));
+      }
     });
 
     res.json({ status: 200, ok: true, periodo: { startDate, endDate }, totalLinhas: linhas.length, avisos, csv: linhas, chamadasSienge: contadorRequisicoesSienge });
@@ -357,10 +375,26 @@ app.get('/api/sienge/sync-contas-a-receber', async (req, res) => {
       if (!saldo || saldo <= 0) return;
       if (!rec.dueDate) return;
       const cliente = rec.clientName || rec.creditorName || 'Cliente não identificado';
-      const cat = (rec.receiptsCategories && rec.receiptsCategories[0]) || null;
-      const cc = (cat && cat.costCenterName) || 'ADMINISTRATIVO';
-      const conta = categoriaFinanceira(cat) || contaDeRecebivelFallback(rec.documentIdentificationId || rec.documentId);
-      linhas.push(linhaCsv(rec.dueDate, `A receber - ${cliente}`, saldo, cc, conta, 'FATURAMENTO'));
+      const complemento = `A receber - ${cliente}`;
+      const receiptsCategories = rec.receiptsCategories || [];
+      const fallbackConta = contaDeRecebivelFallback(rec.documentIdentificationId || rec.documentId);
+      // Título pode estar rateado entre mais de uma obra — uma linha por item do rateio,
+      // cada uma com sua fatia proporcional do saldo. Antes só pegava o item [0] e jogava
+      // o saldo inteiro nele, distorcendo a receita por obra em títulos rateados.
+      // Campo de percentual no /income é "financialCategoryRate" (nome diferente do "rate"
+      // usado em /outcome) — mantém fallback pra "rate" por segurança, caso varie.
+      if (receiptsCategories.length) {
+        receiptsCategories.forEach((cat) => {
+          const rate = cat.financialCategoryRate != null ? cat.financialCategoryRate
+            : (cat.rate != null ? cat.rate : (100 / receiptsCategories.length));
+          const valor = saldo * (rate / 100);
+          const cc = cat.costCenterName || 'ADMINISTRATIVO';
+          const conta = categoriaFinanceira(cat) || fallbackConta;
+          linhas.push(linhaCsv(rec.dueDate, complemento, valor, cc, conta, 'FATURAMENTO'));
+        });
+      } else {
+        linhas.push(linhaCsv(rec.dueDate, complemento, saldo, 'ADMINISTRATIVO', fallbackConta, 'FATURAMENTO'));
+      }
     });
 
     res.json({ status: 200, ok: true, periodo: { startDate, endDate }, totalLinhas: linhas.length, avisos, csv: linhas, chamadasSienge: contadorRequisicoesSienge });
