@@ -336,11 +336,17 @@ app.get('/api/sienge/sync-contas-a-pagar', async (req, res) => {
 
 // ---------- CONTAS A RECEBER (provisão / pendente) — /income ----------
 // GET /income?startDate=&endDate=&selectionType=D&correctionIndexerId=0&correctionDate={endDate}
-//   payments[].operationTypeId aceito: 1, 2, 11 (só relevante se um dia formos trazer os já recebidos)
-//   Aqui só entram os registros SEM payments (ainda pendentes) — o já recebido fica de fora
-//   dessa aba de propósito (é a aba "Contas Recebidas", preenchida manualmente por enquanto).
+// Lógica alinhada à documentação do BI Welter (seção 5.2), onde os números batem:
+//   - saldo: balanceAmount, com correctedBalanceAmount como reserva (ordem invertida em
+//     relação ao que o Monter usava antes)
+//   - cliente: clientName, depois customerName, depois creditorName
+//   - "já recebido": só descarta o título se ele TEM recebimentos E NENHUM deles é de tipo
+//     aceito (1=Pagamento, 2=Outros, 11=Por Bens) — ex: só recebimento cancelado. Um título
+//     com recebimento parcial de tipo aceito continua entrando, com o saldo já líquido do
+//     que falta receber. Antes o Monter descartava só por ter QUALQUER recebimento.
 //
 // Uso: /api/sienge/sync-contas-a-receber?startDate=2026-07-01&endDate=2026-07-31
+const OPERATION_TYPES_ACEITOS_RECEBIMENTO = [1, 2, 11];
 const MAPA_CONTA_RECEBER = {
   CT: '10101 - Receita de Incorporação de Imóveis',
   EMP: '10501 - Empréstimos',
@@ -369,20 +375,20 @@ app.get('/api/sienge/sync-contas-a-receber', async (req, res) => {
     }, avisos, 'income (Contas a Receber)');
 
     registros.forEach((rec) => {
-      const jaRecebido = rec.receipts && rec.receipts.length > 0;
-      if (jaRecebido) return; // só o pendente entra nessa aba
-      const saldo = rec.correctedBalanceAmount ?? rec.balanceAmount ?? 0;
+      const recebimentos = rec.receipts || [];
+      const temRecebimento = recebimentos.length > 0;
+      const temRecebimentoAceito = recebimentos.some((p) => OPERATION_TYPES_ACEITOS_RECEBIMENTO.includes(p.operationTypeId));
+      if (temRecebimento && !temRecebimentoAceito) return; // só recebimento de tipo não aceito (ex: cancelamento) — descarta
+      const saldo = rec.balanceAmount ?? rec.correctedBalanceAmount ?? 0;
       if (!saldo || saldo <= 0) return;
       if (!rec.dueDate) return;
-      const cliente = rec.clientName || rec.creditorName || 'Cliente não identificado';
+      const cliente = rec.clientName || rec.customerName || rec.creditorName || 'Cliente não identificado';
       const complemento = `A receber - ${cliente}`;
       const receiptsCategories = rec.receiptsCategories || [];
       const fallbackConta = contaDeRecebivelFallback(rec.documentIdentificationId || rec.documentId);
       // Título pode estar rateado entre mais de uma obra — uma linha por item do rateio,
-      // cada uma com sua fatia proporcional do saldo. Antes só pegava o item [0] e jogava
-      // o saldo inteiro nele, distorcendo a receita por obra em títulos rateados.
-      // Campo de percentual no /income é "financialCategoryRate" (nome diferente do "rate"
-      // usado em /outcome) — mantém fallback pra "rate" por segurança, caso varie.
+      // cada uma com sua fatia proporcional do saldo. Campo de percentual no /income é
+      // "financialCategoryRate" (nome diferente do "rate" usado em /outcome).
       if (receiptsCategories.length) {
         receiptsCategories.forEach((cat) => {
           const rate = cat.financialCategoryRate != null ? cat.financialCategoryRate
