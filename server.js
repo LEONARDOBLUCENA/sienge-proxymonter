@@ -104,16 +104,25 @@ async function buscarBulkData(recurso, paramsExtras, avisos, nomeParaAviso) {
     if (!r.ok) { avisos.push(`Falha ao buscar ${nomeParaAviso || recurso}: status ${r.status}`); break; }
     const dados = await r.json();
     const pagina = dados.data || [];
+    if (pagina.length > limit) {
+      // O Sienge devolveu mais registro do que o "limit" pedido — isso só é possível se ele
+      // estiver ignorando o parâmetro e mandando o conjunto inteiro numa resposta só. Pedir
+      // "próxima página" nesse caso não traria nada novo, só repetiria o mesmo conjunto
+      // completo de novo (foi isso que causou a duplicação investigada antes). Usa essa
+      // resposta como o total e para por aqui — economiza a cota que estava sendo
+      // desperdiçada em chamadas que não agregavam nada.
+      avisos.push(`${nomeParaAviso || recurso}: Sienge devolveu ${pagina.length} registros numa página só (pedimos limit=${limit}) — parece não paginar esse endpoint. Usando a resposta inteira, sem pedir mais páginas.`);
+      registros = pagina;
+      break;
+    }
     registros = registros.concat(pagina);
     if (pagina.length < limit) break;
     offset += limit;
     await esperar(300); // respiro entre páginas
   }
-  // Proteção: o Sienge, em algumas consultas, devolveu bem mais registro por página do que
-  // o "limit" pedido (ou repetiu bloco de dados entre páginas) — não sabemos a causa exata
-  // do lado deles, mas o efeito é registro idêntico duplicado. Remove aqui, comparando o
-  // registro inteiro (JSON), antes de virar linha de CSV — protege contra a causa, seja
-  // qual for, sem depender de adivinhar o campo de ID certo de cada endpoint.
+  // Proteção: mesmo com a checagem acima, mantém a deduplicação defensiva — comparando o
+  // registro inteiro (JSON), antes de virar linha de CSV — protege contra qualquer outra
+  // causa de duplicata que a gente ainda não tenha identificado.
   const vistos = new Set();
   const semDuplicata = [];
   for (const rec of registros) {
