@@ -63,7 +63,7 @@ let contadorRequisicoesSienge = 0;
 // a cota diária (20 req/dia) já estourou. Nesse segundo caso, insistir não resolve —
 // só queima mais cota esperando. Por isso o retry aqui é curto (poucas tentativas,
 // espera menor) — serve pra throttling passageiro, não pra tentar "furar" limite diário.
-async function fetchSienge(url, tentativas = 3) {
+async function fetchSienge(url, tentativas = 1) {
   for (let i = 0; i < tentativas; i++) {
     contadorRequisicoesSienge++;
     const r = await fetch(url, { headers: { Authorization: authHeader() } });
@@ -109,7 +109,23 @@ async function buscarBulkData(recurso, paramsExtras, avisos, nomeParaAviso) {
     offset += limit;
     await esperar(300); // respiro entre páginas
   }
-  return registros;
+  // Proteção: o Sienge, em algumas consultas, devolveu bem mais registro por página do que
+  // o "limit" pedido (ou repetiu bloco de dados entre páginas) — não sabemos a causa exata
+  // do lado deles, mas o efeito é registro idêntico duplicado. Remove aqui, comparando o
+  // registro inteiro (JSON), antes de virar linha de CSV — protege contra a causa, seja
+  // qual for, sem depender de adivinhar o campo de ID certo de cada endpoint.
+  const vistos = new Set();
+  const semDuplicata = [];
+  for (const rec of registros) {
+    const chave = JSON.stringify(rec);
+    if (vistos.has(chave)) continue;
+    vistos.add(chave);
+    semDuplicata.push(rec);
+  }
+  if (semDuplicata.length < registros.length) {
+    avisos.push(`${nomeParaAviso || recurso}: ${registros.length - semDuplicata.length} registro(s) duplicado(s) pelo Sienge foram removidos antes de processar.`);
+  }
+  return semDuplicata;
 }
 
 // ---------- Rotas de diagnóstico ----------
