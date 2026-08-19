@@ -94,14 +94,23 @@ function linhaCsv(dataISO, complemento, valor, cc, conta, tipo) {
 }
 
 // Busca paginada genérica num endpoint da API Bulk Data (envelope {data: [...]})
-async function buscarBulkData(recurso, paramsExtras, avisos, nomeParaAviso) {
+// "avisos" = informativo (não implica estouro de cota). "avisosCriticos" = erro real do
+// Sienge (429 = cota/limite de requisições) — só esse tipo deve travar as próximas fontes
+// de uma sincronização (ver executarSyncGlobalInterno no index.html).
+async function buscarBulkData(recurso, paramsExtras, avisos, avisosCriticos, nomeParaAviso) {
   let offset = 0;
   const limit = 200;
   let registros = [];
   while (true) {
     const params = new URLSearchParams({ ...paramsExtras, limit: String(limit), offset: String(offset) });
     const r = await fetchSienge(`${SIENGE_BULK_URL}/${recurso}?${params.toString()}`);
-    if (!r.ok) { avisos.push(`Falha ao buscar ${nomeParaAviso || recurso}: status ${r.status}`); break; }
+    if (!r.ok) {
+      avisos.push(`Falha ao buscar ${nomeParaAviso || recurso}: status ${r.status}`);
+      if (r.status === 429) {
+        avisosCriticos.push(`${nomeParaAviso || recurso}: Sienge retornou 429 (cota/limite de requisições) — provável estouro da cota diária.`);
+      }
+      break;
+    }
     const dados = await r.json();
     const pagina = dados.data || [];
     if (pagina.length > limit) {
@@ -215,6 +224,7 @@ app.get('/api/sienge/sync-contas-pagas', async (req, res) => {
   contadorRequisicoesSienge = 0;
   const linhas = [];
   const avisos = [];
+  const avisosCriticos = [];
 
   try {
     // ----- /outcome e /bank-movement rodam em paralelo (são independentes) -----
@@ -223,10 +233,10 @@ app.get('/api/sienge/sync-contas-pagas', async (req, res) => {
     const [registrosOutcome, registrosBanco] = await Promise.all([
       buscarBulkData('outcome', {
         startDate, endDate, selectionType: 'P', correctionIndexerId: '0', correctionDate: endDate,
-      }, avisos, 'outcome (Contas Pagas)'),
+      }, avisos, avisosCriticos, 'outcome (Contas Pagas)'),
       buscarBulkData('bank-movement', {
         startDate, endDate, selectionType: 'M', onlyDetachedMovement: 'S',
-      }, avisos, 'bank-movement'),
+      }, avisos, avisosCriticos, 'bank-movement'),
     ]);
 
     registrosOutcome.forEach((rec) => {
@@ -293,9 +303,9 @@ app.get('/api/sienge/sync-contas-pagas', async (req, res) => {
       }
     });
 
-    res.json({ status: 200, ok: true, periodo: { startDate, endDate }, totalLinhas: linhas.length, avisos, csv: linhas, chamadasSienge: contadorRequisicoesSienge });
+    res.json({ status: 200, ok: true, periodo: { startDate, endDate }, totalLinhas: linhas.length, avisos, avisosCriticos, csv: linhas, chamadasSienge: contadorRequisicoesSienge });
   } catch (err) {
-    res.status(502).json({ erro: 'Falha ao montar sincronização de Contas Pagas', detalhe: String(err), avisos, chamadasSienge: contadorRequisicoesSienge });
+    res.status(502).json({ erro: 'Falha ao montar sincronização de Contas Pagas', detalhe: String(err), avisos, avisosCriticos, chamadasSienge: contadorRequisicoesSienge });
   }
 });
 
@@ -317,11 +327,12 @@ app.get('/api/sienge/sync-contas-a-pagar', async (req, res) => {
   contadorRequisicoesSienge = 0;
   const linhas = [];
   const avisos = [];
+  const avisosCriticos = [];
 
   try {
     const registros = await buscarBulkData('outcome', {
       startDate, endDate, selectionType: 'D', correctionIndexerId: '0', correctionDate: endDate,
-    }, avisos, 'outcome (Contas a Pagar)');
+    }, avisos, avisosCriticos, 'outcome (Contas a Pagar)');
 
     registros.forEach((rec) => {
       const saldo = rec.correctedBalanceAmount ?? rec.balanceAmount ?? 0;
@@ -353,9 +364,9 @@ app.get('/api/sienge/sync-contas-a-pagar', async (req, res) => {
       }
     });
 
-    res.json({ status: 200, ok: true, periodo: { startDate, endDate }, totalLinhas: linhas.length, avisos, csv: linhas, chamadasSienge: contadorRequisicoesSienge });
+    res.json({ status: 200, ok: true, periodo: { startDate, endDate }, totalLinhas: linhas.length, avisos, avisosCriticos, csv: linhas, chamadasSienge: contadorRequisicoesSienge });
   } catch (err) {
-    res.status(502).json({ erro: 'Falha ao montar sincronização de Contas a Pagar', detalhe: String(err), avisos, chamadasSienge: contadorRequisicoesSienge });
+    res.status(502).json({ erro: 'Falha ao montar sincronização de Contas a Pagar', detalhe: String(err), avisos, avisosCriticos, chamadasSienge: contadorRequisicoesSienge });
   }
 });
 
@@ -393,11 +404,12 @@ app.get('/api/sienge/sync-contas-a-receber', async (req, res) => {
   contadorRequisicoesSienge = 0;
   const linhas = [];
   const avisos = [];
+  const avisosCriticos = [];
 
   try {
     const registros = await buscarBulkData('income', {
       startDate, endDate, selectionType: 'D', correctionIndexerId: '0', correctionDate: endDate,
-    }, avisos, 'income (Contas a Receber)');
+    }, avisos, avisosCriticos, 'income (Contas a Receber)');
 
     registros.forEach((rec) => {
       const recebimentos = rec.receipts || [];
@@ -428,9 +440,9 @@ app.get('/api/sienge/sync-contas-a-receber', async (req, res) => {
       }
     });
 
-    res.json({ status: 200, ok: true, periodo: { startDate, endDate }, totalLinhas: linhas.length, avisos, csv: linhas, chamadasSienge: contadorRequisicoesSienge });
+    res.json({ status: 200, ok: true, periodo: { startDate, endDate }, totalLinhas: linhas.length, avisos, avisosCriticos, csv: linhas, chamadasSienge: contadorRequisicoesSienge });
   } catch (err) {
-    res.status(502).json({ erro: 'Falha ao montar sincronização de Contas a Receber', detalhe: String(err), avisos, chamadasSienge: contadorRequisicoesSienge });
+    res.status(502).json({ erro: 'Falha ao montar sincronização de Contas a Receber', detalhe: String(err), avisos, avisosCriticos, chamadasSienge: contadorRequisicoesSienge });
   }
 });
 
