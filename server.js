@@ -248,22 +248,28 @@ app.get('/api/sienge/sync-contas-pagas', async (req, res) => {
         if (!pag.paymentDate) return;
         const netAmount = pag.netAmount ?? pag.amount ?? 0;
         const complemento = `Pagamento - ${credorNome}`;
+        // operationTypeId 11 = "Por Bens" (baixa quitada com bens/permuta, não é saída real
+        // de caixa). Continua entrando no CSV — o Dashboard ainda soma esse valor — mas fica
+        // marcado com porBens:true pra o front-end excluir do Fluxo de Caixa e mostrar como
+        // subdivisão separada no KPI.
+        const ehPorBens = pag.operationTypeId === 11;
+        const marcarPorBens = (linha) => { if (ehPorBens) linha.porBens = true; return linha; };
         if (buildingsCosts.length) {
           buildingsCosts.forEach((bc, idx) => {
             const rate = bc.rate != null ? bc.rate : 100;
             const valor = netAmount * (rate / 100);
             const cat = paymentsCategories[idx] || paymentsCategories[0];
             const conta = categoriaFinanceira(cat) || 'SEM CATEGORIA';
-            linhas.push(linhaCsv(pag.paymentDate, complemento, valor, bc.buildingName || 'ADMINISTRATIVO', conta, 'PAGAMENTO'));
+            linhas.push(marcarPorBens(linhaCsv(pag.paymentDate, complemento, valor, bc.buildingName || 'ADMINISTRATIVO', conta, 'PAGAMENTO')));
           });
         } else if (paymentsCategories.length) {
           paymentsCategories.forEach((cat) => {
             const rate = cat.rate != null ? cat.rate : (100 / paymentsCategories.length);
             const valor = netAmount * (rate / 100);
-            linhas.push(linhaCsv(pag.paymentDate, complemento, valor, cat.costCenterName || 'ADMINISTRATIVO', categoriaFinanceira(cat) || 'SEM CATEGORIA', 'PAGAMENTO'));
+            linhas.push(marcarPorBens(linhaCsv(pag.paymentDate, complemento, valor, cat.costCenterName || 'ADMINISTRATIVO', categoriaFinanceira(cat) || 'SEM CATEGORIA', 'PAGAMENTO')));
           });
         } else {
-          linhas.push(linhaCsv(pag.paymentDate, complemento, netAmount, 'ADMINISTRATIVO', 'SEM CATEGORIA', 'PAGAMENTO'));
+          linhas.push(marcarPorBens(linhaCsv(pag.paymentDate, complemento, netAmount, 'ADMINISTRATIVO', 'SEM CATEGORIA', 'PAGAMENTO')));
         }
       });
     });
