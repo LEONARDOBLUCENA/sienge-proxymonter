@@ -422,7 +422,7 @@ app.get('/api/sienge/sync-contas-a-receber', async (req, res) => {
       const temRecebimento = recebimentos.length > 0;
       const temRecebimentoAceito = recebimentos.some((p) => OPERATION_TYPES_ACEITOS_RECEBIMENTO.includes(p.operationTypeId));
       if (temRecebimento && !temRecebimentoAceito) return; // só recebimento de tipo não aceito (ex: cancelamento) — descarta
-      const saldo = rec.balanceAmount ?? rec.correctedBalanceAmount ?? 0;
+      const saldo = rec.correctedBalanceAmount ?? rec.balanceAmount ?? 0;
       if (!saldo || saldo <= 0) return;
       if (!rec.dueDate) return;
       const cliente = rec.clientName || rec.customerName || rec.creditorName || 'Cliente não identificado';
